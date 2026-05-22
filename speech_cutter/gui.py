@@ -32,6 +32,19 @@ from .presets import PRESETS, build_options
 
 NATURAL_SETTINGS = PRESETS["natural"].settings
 PREVIEW_FRAME_TIMEOUT_SECONDS = 20.0
+APP_BG = "#0f172a"
+APP_PANEL = "#111827"
+CARD_BG = "#f8fafc"
+CARD_INNER_BG = "#f8fafc"
+TEXT_DARK = "#0f172a"
+TEXT_MUTED = "#526070"
+TEXT_LIGHT = "#e5eefb"
+TEXT_LIGHT_MUTED = "#94a3b8"
+ACCENT = "#2563eb"
+ACCENT_HOVER = "#1d4ed8"
+ACCENT_SOFT = "#dbeafe"
+BORDER = "#d7dde8"
+DANGER = "#dc2626"
 
 
 @dataclass(frozen=True)
@@ -70,11 +83,11 @@ class PreviewLoadingDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, *, video_name: str) -> None:
         super().__init__(parent)
         self.title("Loading Preview")
-        self.configure(bg="#f5f1e8")
+        self.configure(bg=CARD_BG)
         self.resizable(False, False)
         self.transient(parent)
 
-        frame = ttk.Frame(self, padding=18)
+        frame = ttk.Frame(self, style="Card.TFrame", padding=20)
         frame.pack(fill="both", expand=True)
 
         ttk.Label(
@@ -82,14 +95,16 @@ class PreviewLoadingDialog(tk.Toplevel):
             text=f"Loading crop preview for:\n{video_name}",
             justify="left",
             wraplength=420,
+            style="Section.TLabel",
         ).pack(anchor="w")
         ttk.Label(
             frame,
             text="The app is still working. Some videos just take longer to open a frame preview.",
             wraplength=420,
+            style="Body.TLabel",
         ).pack(anchor="w", pady=(10, 0))
 
-        self._progress = ttk.Progressbar(frame, mode="indeterminate", length=360)
+        self._progress = ttk.Progressbar(frame, mode="indeterminate", length=360, style="Accent.Horizontal.TProgressbar")
         self._progress.pack(fill="x", pady=(14, 0))
         self._progress.start(10)
 
@@ -191,7 +206,7 @@ class CropSelectionDialog(tk.Toplevel):
     ) -> None:
         super().__init__(parent)
         self.title("Choose Crop")
-        self.configure(bg="#f5f1e8")
+        self.configure(bg=CARD_BG)
         self.resizable(False, False)
         self.transient(parent)
 
@@ -243,7 +258,7 @@ class CropSelectionDialog(tk.Toplevel):
             pass
 
     def _build_layout(self) -> None:
-        frame = ttk.Frame(self, padding=14)
+        frame = ttk.Frame(self, style="Card.TFrame", padding=18)
         frame.pack(fill="both", expand=True)
 
         ttk.Label(
@@ -253,6 +268,7 @@ class CropSelectionDialog(tk.Toplevel):
                 f"The crop is locked to the original aspect ratio ({self._aspect_width_unit}:{self._aspect_height_unit})."
             ),
             wraplength=860,
+            style="Body.TLabel",
         ).pack(anchor="w")
 
         self.canvas = tk.Canvas(
@@ -260,7 +276,7 @@ class CropSelectionDialog(tk.Toplevel):
             width=self._preview_width,
             height=self._preview_height,
             highlightthickness=1,
-            highlightbackground="#c9baa7",
+            highlightbackground=BORDER,
             bg="#000000",
             cursor="crosshair",
         )
@@ -275,14 +291,14 @@ class CropSelectionDialog(tk.Toplevel):
             fill="",
         )
 
-        ttk.Label(frame, textvariable=self.summary_var, wraplength=860).pack(anchor="w")
+        ttk.Label(frame, textvariable=self.summary_var, wraplength=860, style="Body.TLabel").pack(anchor="w")
 
-        buttons = ttk.Frame(frame)
+        buttons = ttk.Frame(frame, style="CardInner.TFrame")
         buttons.pack(fill="x", pady=(12, 0))
 
         ttk.Button(buttons, text="Clear Selection", command=self._clear_selection).pack(side="left")
-        ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side="right")
-        ttk.Button(buttons, text="Use This Crop", command=self._apply).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", style="Danger.TButton", command=self._cancel).pack(side="right")
+        ttk.Button(buttons, text="Use This Crop", style="Primary.TButton", command=self._apply).pack(side="right", padx=(0, 8))
 
     def _bind_events(self) -> None:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -465,9 +481,9 @@ class SpeechCutterApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Speech Cutter")
-        self.geometry("940x780")
-        self.minsize(880, 620)
-        self.configure(bg="#f5f1e8")
+        self.geometry("1120x820")
+        self.minsize(980, 700)
+        self.configure(bg=APP_BG)
 
         self._worker: threading.Thread | None = None
         self._cancel_event = threading.Event()
@@ -534,24 +550,83 @@ class SpeechCutterApp(tk.Tk):
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure(".", font=("Segoe UI", 10))
-        style.configure("Root.TFrame", background="#f5f1e8")
-        style.configure("Card.TFrame", background="#fffaf3")
-        style.configure("CardInner.TFrame", background="#fffaf3")
-        style.configure("Title.TLabel", background="#f5f1e8", foreground="#1f2b34", font=("Segoe UI Semibold", 24))
-        style.configure("Subtitle.TLabel", background="#f5f1e8", foreground="#5b655d", font=("Segoe UI", 11))
-        style.configure("Section.TLabel", background="#fffaf3", foreground="#27343b", font=("Segoe UI Semibold", 11))
-        style.configure("Body.TLabel", background="#fffaf3", foreground="#46535a")
-        style.configure("Status.TLabel", background="#fffaf3", foreground="#263238", font=("Segoe UI Semibold", 10))
-        style.configure("Primary.TButton", font=("Segoe UI Semibold", 10))
-        style.configure("Accent.Horizontal.TProgressbar", troughcolor="#e8ded0", background="#b45f3c", bordercolor="#e8ded0")
+        style.configure(".", font=("Segoe UI", 10), borderwidth=0, focusthickness=0)
+        style.configure("Root.TFrame", background=APP_BG)
+        style.configure("AppPanel.TFrame", background=APP_PANEL)
+        style.configure("Card.TFrame", background=CARD_BG, relief="flat", borderwidth=1)
+        style.configure("CardInner.TFrame", background=CARD_INNER_BG)
+        style.configure("Title.TLabel", background=APP_BG, foreground=TEXT_LIGHT, font=("Segoe UI Semibold", 28))
+        style.configure("Subtitle.TLabel", background=APP_BG, foreground=TEXT_LIGHT_MUTED, font=("Segoe UI", 11))
+        style.configure("Section.TLabel", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI Semibold", 11))
+        style.configure("Body.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Segoe UI", 10))
+        style.configure("Status.TLabel", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI Semibold", 10))
+        style.configure(
+            "TButton",
+            font=("Segoe UI Semibold", 10),
+            padding=(14, 8),
+            background="#e8edf5",
+            foreground=TEXT_DARK,
+            bordercolor=BORDER,
+            lightcolor="#e8edf5",
+            darkcolor="#e8edf5",
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#dce5f1"), ("disabled", "#edf1f7")],
+            foreground=[("disabled", "#94a3b8")],
+        )
+        style.configure(
+            "Primary.TButton",
+            font=("Segoe UI Semibold", 10),
+            padding=(18, 9),
+            background=ACCENT,
+            foreground="#ffffff",
+            bordercolor=ACCENT,
+            lightcolor=ACCENT,
+            darkcolor=ACCENT,
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", ACCENT_HOVER), ("disabled", "#93c5fd")],
+            foreground=[("disabled", "#eff6ff")],
+        )
+        style.configure(
+            "Danger.TButton",
+            font=("Segoe UI Semibold", 10),
+            padding=(14, 8),
+            background="#fee2e2",
+            foreground=DANGER,
+            bordercolor="#fecaca",
+            lightcolor="#fee2e2",
+            darkcolor="#fee2e2",
+        )
+        style.map("Danger.TButton", background=[("active", "#fecaca"), ("disabled", "#f1f5f9")])
+        style.configure(
+            "TEntry",
+            padding=(10, 8),
+            fieldbackground="#ffffff",
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            foreground=TEXT_DARK,
+        )
+        style.configure("TCheckbutton", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI", 10))
+        style.map("TCheckbutton", background=[("active", CARD_BG)], foreground=[("disabled", "#94a3b8")])
+        style.configure(
+            "Accent.Horizontal.TProgressbar",
+            troughcolor="#e2e8f0",
+            background=ACCENT,
+            bordercolor="#e2e8f0",
+            lightcolor=ACCENT,
+            darkcolor=ACCENT,
+        )
         style.configure(
             "Accent.Horizontal.TScale",
-            background="#fffaf3",
-            troughcolor="#d8def8",
-            bordercolor="#d8def8",
-            lightcolor="#5a74ff",
-            darkcolor="#5a74ff",
+            background=CARD_BG,
+            troughcolor=ACCENT_SOFT,
+            bordercolor=ACCENT_SOFT,
+            lightcolor=ACCENT,
+            darkcolor=ACCENT,
         )
 
     def _refresh_setting_labels(self, *_args: object) -> None:
@@ -629,7 +704,7 @@ class SpeechCutterApp(tk.Tk):
 
         self._scroll_canvas = tk.Canvas(
             shell,
-            bg="#f5f1e8",
+            bg=APP_BG,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -638,7 +713,7 @@ class SpeechCutterApp(tk.Tk):
         self._scrollbar.grid(row=0, column=1, sticky="ns")
         self._scroll_canvas.configure(yscrollcommand=self._scrollbar.set)
 
-        root = ttk.Frame(self._scroll_canvas, style="Root.TFrame", padding=18)
+        root = ttk.Frame(self._scroll_canvas, style="Root.TFrame", padding=24)
         self._scroll_window_id = self._scroll_canvas.create_window((0, 0), window=root, anchor="nw")
         root.bind("<Configure>", self._on_scroll_frame_configure)
         self._scroll_canvas.bind("<Configure>", self._on_scroll_canvas_configure)
@@ -647,27 +722,28 @@ class SpeechCutterApp(tk.Tk):
         self._scroll_canvas.bind("<Enter>", self._bind_mousewheel)
         self._scroll_canvas.bind("<Leave>", self._unbind_mousewheel)
 
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(6, weight=1)
+        root.columnconfigure(0, weight=1, uniform="main")
+        root.columnconfigure(1, weight=1, uniform="main")
+        root.rowconfigure(4, weight=1)
 
         hero = ttk.Frame(root, style="Root.TFrame")
-        hero.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 18))
         ttk.Label(hero, text="Speech Cutter", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             hero,
-            text="Load one video or queue several, keep only the spoken parts, and save each MP4 next to its original.",
+            text="Trim speech, add captions, apply crop zooms, and give longer clips a subtle push-in.",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
-        files_card = ttk.Frame(root, style="Card.TFrame", padding=16)
-        files_card.grid(row=1, column=0, sticky="ew")
+        files_card = ttk.Frame(root, style="Card.TFrame", padding=20)
+        files_card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 16))
         files_card.columnconfigure(1, weight=1)
 
         ttk.Label(files_card, text="Source video", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         self.input_entry = ttk.Entry(files_card, textvariable=self.input_var)
         self.input_entry.grid(row=0, column=1, sticky="ew", padx=10)
         self.browse_button = ttk.Button(files_card, text="Browse...", command=self._browse_input)
-        self.browse_button.grid(row=0, column=2)
+        self.browse_button.grid(row=0, column=2, padx=(2, 0))
         self.queue_mode_check = ttk.Checkbutton(
             files_card,
             text="Queue multiple videos and process them one by one",
@@ -692,13 +768,15 @@ class SpeechCutterApp(tk.Tk):
             activestyle="none",
             exportselection=False,
             relief="flat",
-            bg="#fffdf8",
-            fg="#243238",
+            bg="#ffffff",
+            fg=TEXT_DARK,
             highlightthickness=1,
-            highlightbackground="#d8ccb8",
-            selectbackground="#d8def8",
-            selectforeground="#1f2b34",
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            selectbackground=ACCENT_SOFT,
+            selectforeground=TEXT_DARK,
             font=("Segoe UI", 10),
+            borderwidth=0,
         )
         self.queue_listbox.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         self.queue_listbox.bind("<<ListboxSelect>>", self._on_queue_selection)
@@ -709,7 +787,7 @@ class SpeechCutterApp(tk.Tk):
         self.remove_queue_button.grid(row=0, column=0, sticky="w")
         self.clear_queue_button = ttk.Button(queue_actions, text="Clear Queue", command=self._clear_queue)
         self.clear_queue_button.grid(row=0, column=1, sticky="w", padx=(10, 0))
-        ttk.Label(files_card, textvariable=self.source_info_var, style="Body.TLabel", wraplength=780).grid(
+        ttk.Label(files_card, textvariable=self.source_info_var, style="Body.TLabel", wraplength=920).grid(
             row=3,
             column=1,
             columnspan=2,
@@ -718,8 +796,8 @@ class SpeechCutterApp(tk.Tk):
             pady=(10, 0),
         )
 
-        trim_card = ttk.Frame(root, style="Card.TFrame", padding=16)
-        trim_card.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        trim_card = ttk.Frame(root, style="Card.TFrame", padding=20)
+        trim_card.grid(row=2, column=0, sticky="new", padx=(0, 8), pady=(0, 16))
         trim_card.columnconfigure(0, weight=1)
 
         trim_header = ttk.Frame(trim_card, style="CardInner.TFrame")
@@ -741,11 +819,11 @@ class SpeechCutterApp(tk.Tk):
             trim_card,
             text="Natural trimming is always used. This setting keeps a little extra time before and after speech so cuts feel less abrupt.",
             style="Body.TLabel",
-            wraplength=780,
+            wraplength=470,
         ).grid(row=2, column=0, sticky="w", pady=(12, 0))
 
-        crop_card = ttk.Frame(root, style="Card.TFrame", padding=16)
-        crop_card.grid(row=3, column=0, sticky="ew", pady=14)
+        crop_card = ttk.Frame(root, style="Card.TFrame", padding=20)
+        crop_card.grid(row=3, column=0, sticky="new", padx=(0, 8), pady=(0, 16))
         crop_card.columnconfigure(2, weight=1)
 
         ttk.Checkbutton(
@@ -766,17 +844,17 @@ class SpeechCutterApp(tk.Tk):
         )
         self.pick_queue_crops_button.grid(row=0, column=1, sticky="w", padx=(10, 0))
         self.clear_crop_button = ttk.Button(crop_actions, text="Clear Crop", command=self._clear_crop_selection)
-        self.clear_crop_button.grid(row=0, column=2, sticky="w", padx=(10, 0))
-        ttk.Label(crop_card, textvariable=self.crop_summary_var, style="Body.TLabel", wraplength=520).grid(
-            row=1,
-            column=2,
+        self.clear_crop_button.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(crop_card, textvariable=self.crop_summary_var, style="Body.TLabel", wraplength=470).grid(
+            row=2,
+            column=0,
+            columnspan=3,
             sticky="w",
-            padx=(16, 0),
             pady=(12, 0),
         )
 
         crop_every_header = ttk.Frame(crop_card, style="CardInner.TFrame")
-        crop_every_header.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        crop_every_header.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         crop_every_header.columnconfigure(0, weight=1)
         ttk.Label(crop_every_header, text="Apply Crop Every Nth Segment", style="Section.TLabel").grid(
             row=0,
@@ -796,10 +874,10 @@ class SpeechCutterApp(tk.Tk):
             command=self._on_crop_every_scale,
             style="Accent.Horizontal.TScale",
         )
-        self.crop_every_scale.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self.crop_every_scale.grid(row=4, column=0, columnspan=3, sticky="ew")
 
         crop_min_header = ttk.Frame(crop_card, style="CardInner.TFrame")
-        crop_min_header.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        crop_min_header.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         crop_min_header.columnconfigure(0, weight=1)
         ttk.Label(crop_min_header, text="Skip Crop Below (seconds)", style="Section.TLabel").grid(
             row=0,
@@ -819,10 +897,10 @@ class SpeechCutterApp(tk.Tk):
             command=self._on_crop_min_scale,
             style="Accent.Horizontal.TScale",
         )
-        self.crop_min_scale.grid(row=5, column=0, columnspan=3, sticky="ew")
+        self.crop_min_scale.grid(row=6, column=0, columnspan=3, sticky="ew")
 
         crop_zoom_header = ttk.Frame(crop_card, style="CardInner.TFrame")
-        crop_zoom_header.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        crop_zoom_header.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         crop_zoom_header.columnconfigure(0, weight=1)
         ttk.Label(crop_zoom_header, text="Keep Zoom For (seconds)", style="Section.TLabel").grid(
             row=0,
@@ -842,17 +920,17 @@ class SpeechCutterApp(tk.Tk):
             command=self._on_crop_zoom_scale,
             style="Accent.Horizontal.TScale",
         )
-        self.crop_zoom_scale.grid(row=7, column=0, columnspan=3, sticky="ew")
+        self.crop_zoom_scale.grid(row=8, column=0, columnspan=3, sticky="ew")
 
         self.crop_middle_long_check = ttk.Checkbutton(
             crop_card,
             text="Also zoom the middle of long non-zoomed segments",
             variable=self.crop_middle_long_var,
         )
-        self.crop_middle_long_check.grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.crop_middle_long_check.grid(row=9, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
         crop_middle_threshold_header = ttk.Frame(crop_card, style="CardInner.TFrame")
-        crop_middle_threshold_header.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        crop_middle_threshold_header.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         crop_middle_threshold_header.columnconfigure(0, weight=1)
         ttk.Label(
             crop_middle_threshold_header,
@@ -873,7 +951,7 @@ class SpeechCutterApp(tk.Tk):
             command=self._on_crop_middle_long_threshold_scale,
             style="Accent.Horizontal.TScale",
         )
-        self.crop_middle_long_threshold_scale.grid(row=10, column=0, columnspan=3, sticky="ew")
+        self.crop_middle_long_threshold_scale.grid(row=11, column=0, columnspan=3, sticky="ew")
 
         ttk.Label(
             crop_card,
@@ -884,8 +962,8 @@ class SpeechCutterApp(tk.Tk):
                 "optional long-segment rule adds a centered zoom on long segments that were not picked by the main cadence."
             ),
             style="Body.TLabel",
-            wraplength=780,
-        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(12, 0))
+            wraplength=470,
+        ).grid(row=12, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
         self._crop_widgets = [
             self.pick_crop_button,
@@ -898,8 +976,8 @@ class SpeechCutterApp(tk.Tk):
             self.crop_middle_long_threshold_scale,
         ]
 
-        motion_card = ttk.Frame(root, style="Card.TFrame", padding=16)
-        motion_card.grid(row=4, column=0, sticky="ew", pady=(0, 14))
+        motion_card = ttk.Frame(root, style="Card.TFrame", padding=20)
+        motion_card.grid(row=2, column=1, sticky="new", padx=(8, 0), pady=(0, 16))
         motion_card.columnconfigure(0, weight=1)
 
         ttk.Checkbutton(
@@ -960,11 +1038,11 @@ class SpeechCutterApp(tk.Tk):
                 "Manual crop/zoom segments keep their chosen crop instead."
             ),
             style="Body.TLabel",
-            wraplength=780,
+            wraplength=470,
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
-        caption_card = ttk.Frame(root, style="Card.TFrame", padding=16)
-        caption_card.grid(row=5, column=0, sticky="ew")
+        caption_card = ttk.Frame(root, style="Card.TFrame", padding=20)
+        caption_card.grid(row=3, column=1, sticky="new", padx=(8, 0), pady=(0, 16))
         caption_card.columnconfigure(0, weight=1)
 
         ttk.Label(caption_card, text="Captions & Filter", style="Section.TLabel").grid(row=0, column=0, sticky="w")
@@ -985,11 +1063,11 @@ class SpeechCutterApp(tk.Tk):
                 "The first run may download the speech-to-text model."
             ),
             style="Body.TLabel",
-            wraplength=780,
+            wraplength=470,
         ).grid(row=3, column=0, sticky="w", pady=(12, 0))
 
-        activity_card = ttk.Frame(root, style="Card.TFrame", padding=16)
-        activity_card.grid(row=6, column=0, sticky="nsew", pady=(14, 0))
+        activity_card = ttk.Frame(root, style="Card.TFrame", padding=20)
+        activity_card.grid(row=4, column=0, columnspan=2, sticky="nsew")
         activity_card.columnconfigure(0, weight=1)
         activity_card.rowconfigure(4, weight=1)
 
@@ -999,7 +1077,13 @@ class SpeechCutterApp(tk.Tk):
 
         self.start_button = ttk.Button(actions, text="Start", style="Primary.TButton", command=self._start_processing)
         self.start_button.grid(row=0, column=0, sticky="w")
-        self.cancel_button = ttk.Button(actions, text="Cancel", command=self._cancel_processing, state="disabled")
+        self.cancel_button = ttk.Button(
+            actions,
+            text="Cancel",
+            style="Danger.TButton",
+            command=self._cancel_processing,
+            state="disabled",
+        )
         self.cancel_button.grid(row=0, column=1, sticky="w", padx=(10, 0))
         self.open_folder_button = ttk.Button(actions, text="Open Output Folder", command=self._open_output_folder, state="disabled")
         self.open_folder_button.grid(row=0, column=2, sticky="w", padx=(10, 0))
@@ -1022,13 +1106,17 @@ class SpeechCutterApp(tk.Tk):
         self.log_box = scrolledtext.ScrolledText(
             activity_card,
             wrap="word",
-            height=14,
+            height=11,
             relief="flat",
-            bg="#fffdf8",
-            fg="#243238",
+            bg="#0b1220",
+            fg="#e5eefb",
+            insertbackground="#e5eefb",
+            selectbackground=ACCENT,
+            selectforeground="#ffffff",
             font=("Cascadia Mono", 10),
-            padx=10,
-            pady=10,
+            padx=14,
+            pady=12,
+            borderwidth=0,
         )
         self.log_box.grid(row=4, column=0, sticky="nsew", pady=(4, 0))
         self.log_box.insert("end", "Ready.\n")
