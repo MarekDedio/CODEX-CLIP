@@ -1,4 +1,2 @@
 @echo off
-setlocal
-cd /d "%~dp0"
-call "%~dp0run.bat"
+wscript.exe "%~dp0launch_speech_cutter_hidden.vbs"
