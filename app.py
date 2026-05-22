@@ -6,7 +6,14 @@ from pathlib import Path
 
 from speech_cutter.captions import CaptionSettings
 from speech_cutter.gui import launch_gui
-from speech_cutter.pipeline import build_output_path, check_runtime, process_video
+from speech_cutter.pipeline import (
+    DEFAULT_PUSH_IN_MAX_ZOOM,
+    DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS,
+    MotionSettings,
+    build_output_path,
+    check_runtime,
+    process_video,
+)
 from speech_cutter.presets import PRESETS, build_options
 
 
@@ -61,6 +68,24 @@ def main(argv: list[str] | None = None) -> int:
         default=CaptionSettings().model_name,
         help="Whisper model name to use for subtitles and profanity timing.",
     )
+    parser.add_argument(
+        "--push-in",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add a slow center push-in to longer speech segments.",
+    )
+    parser.add_argument(
+        "--push-in-min-seconds",
+        type=float,
+        default=DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS,
+        help="Minimum speech segment length that receives the slow push-in.",
+    )
+    parser.add_argument(
+        "--push-in-zoom",
+        type=float,
+        default=DEFAULT_PUSH_IN_MAX_ZOOM,
+        help="Final push-in zoom amount, such as 1.08 for an 8 percent zoom.",
+    )
     args = parser.parse_args(argv)
 
     issues = check_runtime()
@@ -84,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
                 else args.padding_ms
             ),
             merge_gap_ms=args.merge_gap_ms,
+            motion=MotionSettings(
+                push_in_enabled=bool(args.push_in),
+                push_in_min_segment_seconds=max(0.0, float(args.push_in_min_seconds)),
+                push_in_max_zoom=max(1.001, float(args.push_in_zoom)),
+            ),
             captions=CaptionSettings(
                 enabled=bool(args.captions),
                 profanity_filter=bool(args.profanity_filter),

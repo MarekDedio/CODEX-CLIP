@@ -10,6 +10,7 @@ Speech Cutter is a small desktop app that loads a video, finds the parts with hu
 - Saves the result as `<original_name>_speech_only.mp4` in the same folder as the source video.
 - Uses the natural trim profile by default, with a simple padding control in seconds.
 - Can optionally crop selected segments with a visual frame picker that stays locked to the original video aspect ratio.
+- Can add a slow center push-in to longer speech segments for subtle visual motion.
 - Can burn in TikTok-style subtitles with a highlighted active word.
 - Can automatically mute detected profanity and censor it in the subtitles.
 - Runs in a simple Windows-friendly Tkinter GUI and also supports a CLI mode.
@@ -45,7 +46,7 @@ python -m venv .venv
 ## CLI example
 
 ```powershell
-.\.venv\Scripts\python app.py input.mp4 --padding-seconds 0.18 --captions --profanity-filter
+.\.venv\Scripts\python app.py input.mp4 --padding-seconds 0.18 --push-in --captions --profanity-filter
 ```
 
 ## Notes

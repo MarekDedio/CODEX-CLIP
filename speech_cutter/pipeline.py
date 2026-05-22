@@ -25,6 +25,8 @@ from .vad import (
 
 MODEL_PATH = Path(__file__).resolve().parent / "assets" / "silero_vad_16k_op15.onnx"
 DEFAULT_MID_ZOOM_MIN_SEGMENT_SECONDS = 5.0
+DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS = 4.0
+DEFAULT_PUSH_IN_MAX_ZOOM = 1.08
 
 
 class ProcessingError(RuntimeError):
@@ -43,6 +45,7 @@ class UserCancelledError(ProcessingError):
 class ProcessingOptions:
     vad: VadSettings = field(default_factory=VadSettings)
     crop: "CropSettings" = field(default_factory=lambda: CropSettings())
+    motion: "MotionSettings" = field(default_factory=lambda: MotionSettings())
     captions: CaptionSettings = field(default_factory=CaptionSettings)
     video_crf: int = 18
     video_preset: str = "veryfast"
@@ -60,6 +63,13 @@ class CropSettings:
     zoom_duration_seconds: float = 0.0
     mid_zoom_on_long_segments: bool = True
     mid_zoom_min_segment_seconds: float = DEFAULT_MID_ZOOM_MIN_SEGMENT_SECONDS
+
+
+@dataclass(frozen=True)
+class MotionSettings:
+    push_in_enabled: bool = False
+    push_in_min_segment_seconds: float = DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS
+    push_in_max_zoom: float = DEFAULT_PUSH_IN_MAX_ZOOM
 
 
 @dataclass(frozen=True)
@@ -208,6 +218,7 @@ def process_video(
             video_width=_as_int(metadata.get("video_width")),
             video_height=_as_int(metadata.get("video_height")),
         )
+        motion_settings = _prepare_motion_settings(options.motion)
 
         kept_duration = sum(segment.duration for segment in segments)
         _log(
@@ -221,6 +232,7 @@ def process_video(
                 video_width=_as_int(metadata.get("video_width")),
                 video_height=_as_int(metadata.get("video_height")),
                 crop_settings=crop_settings,
+                motion_settings=motion_settings,
             ),
             encoding="utf-8",
         )
@@ -420,10 +432,16 @@ def _build_filter_script(
     video_width: int,
     video_height: int,
     crop_settings: CropSettings | None,
+    motion_settings: MotionSettings | None,
 ) -> str:
     lines: list[str] = []
-    clip_specs = _expand_segment_clips(segments, crop_settings=crop_settings)
-    for index, (segment, apply_crop) in enumerate(clip_specs):
+    clip_specs = _expand_segment_clips(
+        segments,
+        crop_settings=crop_settings,
+        motion_settings=motion_settings,
+    )
+    for index, clip in enumerate(clip_specs):
+        segment = clip.segment
         start = f"{segment.start:.6f}"
         end = f"{segment.end:.6f}"
 
@@ -431,12 +449,22 @@ def _build_filter_script(
             f"[0:v:0]trim=start={start}:end={end}",
             "setpts=PTS-STARTPTS",
         ]
-        if apply_crop:
+        if clip.effect == "crop":
             assert crop_settings is not None
             video_filters.append(
                 f"crop=w={crop_settings.width}:h={crop_settings.height}:x={crop_settings.x}:y={crop_settings.y}"
             )
             video_filters.append(f"scale={video_width}:{video_height}:flags=lanczos")
+        elif clip.effect == "push_in":
+            assert motion_settings is not None
+            video_filters.extend(
+                _build_push_in_filters(
+                    video_width=video_width,
+                    video_height=video_height,
+                    segment_duration=segment.duration,
+                    max_zoom=motion_settings.push_in_max_zoom,
+                )
+            )
         video_filters.append("setsar=1")
 
         lines.append(",".join(video_filters) + f"[v{index}]")
@@ -447,34 +475,50 @@ def _build_filter_script(
     return ";\n".join(lines) + "\n"
 
 
+@dataclass(frozen=True)
+class ClipSpec:
+    segment: SpeechSegment
+    effect: str = "none"
+
+
 def _expand_segment_clips(
     segments: list[SpeechSegment],
     *,
     crop_settings: CropSettings | None,
-) -> list[tuple[SpeechSegment, bool]]:
-    clips: list[tuple[SpeechSegment, bool]] = []
+    motion_settings: MotionSettings | None,
+) -> list[ClipSpec]:
+    clips: list[ClipSpec] = []
     for index, segment in enumerate(segments, start=1):
         should_crop = _should_crop_segment(segment, index, crop_settings)
-        clips.extend(_split_segment_for_zoom(segment, should_crop=should_crop, crop_settings=crop_settings))
+        clips.extend(
+            _split_segment_for_effects(
+                segment,
+                should_crop=should_crop,
+                crop_settings=crop_settings,
+                motion_settings=motion_settings,
+            )
+        )
     return clips
 
 
-def _split_segment_for_zoom(
+def _split_segment_for_effects(
     segment: SpeechSegment,
     *,
     should_crop: bool,
     crop_settings: CropSettings | None,
-) -> list[tuple[SpeechSegment, bool]]:
-    if crop_settings is None:
-        return [(segment, False)]
+    motion_settings: MotionSettings | None,
+) -> list[ClipSpec]:
+    if crop_settings is not None:
+        if should_crop:
+            return _build_zoom_clips(segment, crop_settings=crop_settings, alignment="start")
 
-    if should_crop:
-        return _build_zoom_clips(segment, crop_settings=crop_settings, alignment="start")
+        if _should_apply_middle_zoom(segment, crop_settings):
+            return _build_zoom_clips(segment, crop_settings=crop_settings, alignment="middle")
 
-    if _should_apply_middle_zoom(segment, crop_settings):
-        return _build_zoom_clips(segment, crop_settings=crop_settings, alignment="middle")
+    if _should_apply_push_in(segment, motion_settings):
+        return [ClipSpec(segment, "push_in")]
 
-    return [(segment, False)]
+    return [ClipSpec(segment)]
 
 
 def _should_apply_middle_zoom(
@@ -496,10 +540,10 @@ def _build_zoom_clips(
     *,
     crop_settings: CropSettings,
     alignment: str,
-) -> list[tuple[SpeechSegment, bool]]:
+) -> list[ClipSpec]:
     zoom_duration = crop_settings.zoom_duration_seconds
     if zoom_duration <= 0 or segment.duration <= zoom_duration:
-        return [(segment, True)]
+        return [ClipSpec(segment, "crop")]
 
     if alignment == "middle":
         padding = max((segment.duration - zoom_duration) / 2.0, 0.0)
@@ -509,15 +553,45 @@ def _build_zoom_clips(
 
     zoom_end = min(segment.end, zoom_start + zoom_duration)
     if zoom_end <= zoom_start:
-        return [(segment, False)]
+        return [ClipSpec(segment)]
 
-    clips: list[tuple[SpeechSegment, bool]] = []
+    clips: list[ClipSpec] = []
     if zoom_start > segment.start:
-        clips.append((SpeechSegment(segment.start, zoom_start), False))
-    clips.append((SpeechSegment(zoom_start, zoom_end), True))
+        clips.append(ClipSpec(SpeechSegment(segment.start, zoom_start)))
+    clips.append(ClipSpec(SpeechSegment(zoom_start, zoom_end), "crop"))
     if zoom_end < segment.end:
-        clips.append((SpeechSegment(zoom_end, segment.end), False))
+        clips.append(ClipSpec(SpeechSegment(zoom_end, segment.end)))
     return clips
+
+
+def _should_apply_push_in(
+    segment: SpeechSegment,
+    motion_settings: MotionSettings | None,
+) -> bool:
+    if motion_settings is None:
+        return False
+    return segment.duration >= motion_settings.push_in_min_segment_seconds
+
+
+def _build_push_in_filters(
+    *,
+    video_width: int,
+    video_height: int,
+    segment_duration: float,
+    max_zoom: float,
+) -> list[str]:
+    zoom_delta = max(0.0, max_zoom - 1.0)
+    duration = max(segment_duration, 0.001)
+    zoom_expr = f"1+{zoom_delta:.6f}*(1-cos(PI*min(t/{duration:.6f},1)))/2"
+    return [
+        (
+            "scale="
+            f"w='trunc(iw*({zoom_expr})/2)*2':"
+            f"h='trunc(ih*({zoom_expr})/2)*2':"
+            "eval=frame:flags=lanczos"
+        ),
+        f"crop=w={video_width}:h={video_height}:x='(iw-ow)/2':y='(ih-oh)/2'",
+    ]
 
 
 def _create_caption_artifacts(
@@ -882,6 +956,18 @@ def _prepare_crop_settings(
         raise ProcessingError("Long-segment middle zoom threshold cannot be negative.")
 
     return crop
+
+
+def _prepare_motion_settings(motion: MotionSettings) -> MotionSettings | None:
+    if not motion.push_in_enabled:
+        return None
+    if motion.push_in_min_segment_seconds < 0:
+        raise ProcessingError("Push-in segment length cannot be negative.")
+    if motion.push_in_max_zoom <= 1.0:
+        raise ProcessingError("Push-in zoom must be greater than 1.0.")
+    if motion.push_in_max_zoom > 1.5:
+        raise ProcessingError("Push-in zoom must be 1.5x or lower.")
+    return motion
 
 
 def _should_crop_segment(

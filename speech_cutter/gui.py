@@ -15,6 +15,9 @@ from .captions import CaptionSettings
 from .pipeline import (
     CropSettings,
     DEFAULT_MID_ZOOM_MIN_SEGMENT_SECONDS,
+    DEFAULT_PUSH_IN_MAX_ZOOM,
+    DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS,
+    MotionSettings,
     NoSpeechDetectedError,
     ProcessingOptions,
     ProcessingResult,
@@ -498,6 +501,11 @@ class SpeechCutterApp(tk.Tk):
         self.crop_middle_long_var = tk.BooleanVar(value=True)
         self.crop_middle_long_threshold_var = tk.DoubleVar(value=DEFAULT_MID_ZOOM_MIN_SEGMENT_SECONDS)
         self.crop_middle_long_threshold_value_var = tk.StringVar()
+        self.push_in_enabled_var = tk.BooleanVar(value=True)
+        self.push_in_min_seconds_var = tk.DoubleVar(value=DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS)
+        self.push_in_min_seconds_value_var = tk.StringVar()
+        self.push_in_zoom_percent_var = tk.DoubleVar(value=(DEFAULT_PUSH_IN_MAX_ZOOM - 1.0) * 100.0)
+        self.push_in_zoom_percent_value_var = tk.StringVar()
         self.captions_enabled_var = tk.BooleanVar(value=True)
         self.profanity_filter_var = tk.BooleanVar(value=True)
 
@@ -506,6 +514,8 @@ class SpeechCutterApp(tk.Tk):
         self.crop_min_seconds_var.trace_add("write", self._refresh_setting_labels)
         self.crop_zoom_seconds_var.trace_add("write", self._refresh_setting_labels)
         self.crop_middle_long_threshold_var.trace_add("write", self._refresh_setting_labels)
+        self.push_in_min_seconds_var.trace_add("write", self._refresh_setting_labels)
+        self.push_in_zoom_percent_var.trace_add("write", self._refresh_setting_labels)
 
         self._configure_styles()
         self._refresh_setting_labels()
@@ -551,6 +561,8 @@ class SpeechCutterApp(tk.Tk):
         zoom_seconds = float(self.crop_zoom_seconds_var.get())
         self.crop_zoom_seconds_value_var.set("Full segment" if zoom_seconds <= 0.0 else f"{zoom_seconds:.1f}s")
         self.crop_middle_long_threshold_value_var.set(f"{float(self.crop_middle_long_threshold_var.get()):.1f}s")
+        self.push_in_min_seconds_value_var.set(f"{float(self.push_in_min_seconds_var.get()):.1f}s")
+        self.push_in_zoom_percent_value_var.set(f"{float(self.push_in_zoom_percent_var.get()):.0f}%")
 
     def _on_padding_scale(self, value: str) -> None:
         snapped = min(3.0, max(0.0, round(float(value) / 0.05) * 0.05))
@@ -580,6 +592,17 @@ class SpeechCutterApp(tk.Tk):
         snapped = round(snapped, 1)
         if abs(float(self.crop_middle_long_threshold_var.get()) - snapped) > 1e-9:
             self.crop_middle_long_threshold_var.set(snapped)
+
+    def _on_push_in_min_scale(self, value: str) -> None:
+        snapped = min(30.0, max(1.0, round(float(value) / 0.5) * 0.5))
+        snapped = round(snapped, 1)
+        if abs(float(self.push_in_min_seconds_var.get()) - snapped) > 1e-9:
+            self.push_in_min_seconds_var.set(snapped)
+
+    def _on_push_in_zoom_scale(self, value: str) -> None:
+        snapped = min(25.0, max(2.0, round(float(value))))
+        if abs(float(self.push_in_zoom_percent_var.get()) - snapped) > 1e-9:
+            self.push_in_zoom_percent_var.set(snapped)
 
     def _on_scroll_frame_configure(self, _event: tk.Event[tk.Widget] | None = None) -> None:
         self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
@@ -625,7 +648,7 @@ class SpeechCutterApp(tk.Tk):
         self._scroll_canvas.bind("<Leave>", self._unbind_mousewheel)
 
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(5, weight=1)
+        root.rowconfigure(6, weight=1)
 
         hero = ttk.Frame(root, style="Root.TFrame")
         hero.grid(row=0, column=0, sticky="ew", pady=(0, 14))
@@ -875,8 +898,73 @@ class SpeechCutterApp(tk.Tk):
             self.crop_middle_long_threshold_scale,
         ]
 
+        motion_card = ttk.Frame(root, style="Card.TFrame", padding=16)
+        motion_card.grid(row=4, column=0, sticky="ew", pady=(0, 14))
+        motion_card.columnconfigure(0, weight=1)
+
+        ttk.Checkbutton(
+            motion_card,
+            text="Slow push-in on longer speech segments",
+            variable=self.push_in_enabled_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        push_in_min_header = ttk.Frame(motion_card, style="CardInner.TFrame")
+        push_in_min_header.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        push_in_min_header.columnconfigure(0, weight=1)
+        ttk.Label(push_in_min_header, text="Apply Push-In Above (seconds)", style="Section.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        ttk.Label(push_in_min_header, textvariable=self.push_in_min_seconds_value_var, style="Body.TLabel").grid(
+            row=0,
+            column=1,
+            sticky="e",
+        )
+        self.push_in_min_scale = ttk.Scale(
+            motion_card,
+            from_=1.0,
+            to=30.0,
+            variable=self.push_in_min_seconds_var,
+            command=self._on_push_in_min_scale,
+            style="Accent.Horizontal.TScale",
+        )
+        self.push_in_min_scale.grid(row=2, column=0, columnspan=2, sticky="ew")
+
+        push_in_zoom_header = ttk.Frame(motion_card, style="CardInner.TFrame")
+        push_in_zoom_header.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        push_in_zoom_header.columnconfigure(0, weight=1)
+        ttk.Label(push_in_zoom_header, text="Final Push-In Amount", style="Section.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        ttk.Label(push_in_zoom_header, textvariable=self.push_in_zoom_percent_value_var, style="Body.TLabel").grid(
+            row=0,
+            column=1,
+            sticky="e",
+        )
+        self.push_in_zoom_scale = ttk.Scale(
+            motion_card,
+            from_=2.0,
+            to=25.0,
+            variable=self.push_in_zoom_percent_var,
+            command=self._on_push_in_zoom_scale,
+            style="Accent.Horizontal.TScale",
+        )
+        self.push_in_zoom_scale.grid(row=4, column=0, columnspan=2, sticky="ew")
+        ttk.Label(
+            motion_card,
+            text=(
+                "Long speech clips get a gentle center zoom that eases in over the whole segment. "
+                "Manual crop/zoom segments keep their chosen crop instead."
+            ),
+            style="Body.TLabel",
+            wraplength=780,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
         caption_card = ttk.Frame(root, style="Card.TFrame", padding=16)
-        caption_card.grid(row=4, column=0, sticky="ew")
+        caption_card.grid(row=5, column=0, sticky="ew")
         caption_card.columnconfigure(0, weight=1)
 
         ttk.Label(caption_card, text="Captions & Filter", style="Section.TLabel").grid(row=0, column=0, sticky="w")
@@ -901,7 +989,7 @@ class SpeechCutterApp(tk.Tk):
         ).grid(row=3, column=0, sticky="w", pady=(12, 0))
 
         activity_card = ttk.Frame(root, style="Card.TFrame", padding=16)
-        activity_card.grid(row=5, column=0, sticky="nsew", pady=(14, 0))
+        activity_card.grid(row=6, column=0, sticky="nsew", pady=(14, 0))
         activity_card.columnconfigure(0, weight=1)
         activity_card.rowconfigure(4, weight=1)
 
@@ -1433,8 +1521,10 @@ class SpeechCutterApp(tk.Tk):
             crop_min_seconds = max(0.0, float(self.crop_min_seconds_var.get()))
             crop_zoom_seconds = max(0.0, float(self.crop_zoom_seconds_var.get()))
             crop_middle_long_threshold_seconds = max(0.0, float(self.crop_middle_long_threshold_var.get()))
+            push_in_min_seconds = max(0.0, float(self.push_in_min_seconds_var.get()))
+            push_in_max_zoom = 1.0 + max(0.0, float(self.push_in_zoom_percent_var.get())) / 100.0
         except (tk.TclError, ValueError):
-            messagebox.showerror("Invalid settings", "One of the trim or crop settings is not valid.")
+            messagebox.showerror("Invalid settings", "One of the trim, crop, or motion settings is not valid.")
             return None
 
         if self.queue_enabled_var.get():
@@ -1492,6 +1582,11 @@ class SpeechCutterApp(tk.Tk):
                 mid_zoom_on_long_segments=bool(self.crop_middle_long_var.get()),
                 mid_zoom_min_segment_seconds=crop_middle_long_threshold_seconds,
             )
+            motion_settings = MotionSettings(
+                push_in_enabled=bool(self.push_in_enabled_var.get()),
+                push_in_min_segment_seconds=push_in_min_seconds,
+                push_in_max_zoom=push_in_max_zoom,
+            )
             jobs.append(
                 ProcessingJob(
                     input_path=video.path,
@@ -1501,6 +1596,7 @@ class SpeechCutterApp(tk.Tk):
                         padding_ms=int(round(padding_seconds * 1000)),
                         merge_gap_ms=NATURAL_SETTINGS.merge_gap_ms,
                         crop=crop_settings,
+                        motion=motion_settings,
                         captions=caption_settings,
                     ),
                 )

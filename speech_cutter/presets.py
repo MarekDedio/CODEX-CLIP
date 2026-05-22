@@ -4,7 +4,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 
 from .captions import CaptionSettings
-from .pipeline import CropSettings, ProcessingOptions
+from .pipeline import CropSettings, MotionSettings, ProcessingOptions
 from .vad import VadSettings
 
 
@@ -73,6 +73,7 @@ def build_options(
     padding_ms: int | None = None,
     merge_gap_ms: int | None = None,
     crop: CropSettings | None = None,
+    motion: MotionSettings | None = None,
     captions: CaptionSettings | None = None,
 ) -> ProcessingOptions:
     preset = PRESETS[preset_key]
@@ -86,5 +87,6 @@ def build_options(
     return ProcessingOptions(
         vad=settings,
         crop=crop or CropSettings(),
+        motion=motion or MotionSettings(),
         captions=captions or CaptionSettings(),
     )
