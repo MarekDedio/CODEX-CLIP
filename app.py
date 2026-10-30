@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -69,6 +70,45 @@ def main(argv: list[str] | None = None) -> int:
         help="Whisper model name to use for subtitles and profanity timing.",
     )
     parser.add_argument(
+        "--transcription-provider",
+        choices=("local", "groq"),
+        default="local",
+        help="Run Whisper locally or use the Groq speech-to-text API.",
+    )
+    parser.add_argument(
+        "--groq-api-key",
+        default=os.environ.get("GROQ_API_KEY", ""),
+        help="Groq API key. Prefer setting GROQ_API_KEY instead of putting it in shell history.",
+    )
+    parser.add_argument(
+        "--groq-model",
+        choices=("whisper-large-v3-turbo", "whisper-large-v3"),
+        default=CaptionSettings().groq_model,
+        help="Whisper model used by Groq transcription.",
+    )
+    parser.add_argument(
+        "--enhanced-polish-recognition",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use a larger model and Polish-specific decoding for more accurate Polish subtitles.",
+    )
+    parser.add_argument(
+        "--ai-transcript-correction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Check and correct transcript context with Gemini before creating subtitles.",
+    )
+    parser.add_argument(
+        "--gemini-api-key",
+        default=os.environ.get("GEMINI_API_KEY", ""),
+        help="Gemini API key. Prefer setting GEMINI_API_KEY instead of putting it in shell history.",
+    )
+    parser.add_argument(
+        "--gemini-model",
+        default=CaptionSettings().gemini_model,
+        help="Gemini model used for transcript correction.",
+    )
+    parser.add_argument(
         "--push-in",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -87,6 +127,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Final push-in zoom amount, such as 1.08 for an 8 percent zoom.",
     )
     args = parser.parse_args(argv)
+
+    if args.ai_transcript_correction and not args.captions:
+        parser.error("--ai-transcript-correction requires --captions")
+    if args.ai_transcript_correction and not str(args.gemini_api_key).strip():
+        parser.error("--ai-transcript-correction requires GEMINI_API_KEY or --gemini-api-key")
+    if (
+        args.transcription_provider == "groq"
+        and (args.captions or args.profanity_filter)
+        and not str(args.groq_api_key).strip()
+    ):
+        parser.error("Groq transcription requires GROQ_API_KEY or --groq-api-key")
 
     issues = check_runtime()
     if issues:
@@ -118,6 +169,13 @@ def main(argv: list[str] | None = None) -> int:
                 enabled=bool(args.captions),
                 profanity_filter=bool(args.profanity_filter),
                 model_name=str(args.caption_model),
+                enhanced_polish_recognition=bool(args.enhanced_polish_recognition),
+                transcription_provider=str(args.transcription_provider),
+                groq_api_key=str(args.groq_api_key),
+                groq_model=str(args.groq_model),
+                ai_correction_enabled=bool(args.ai_transcript_correction),
+                gemini_api_key=str(args.gemini_api_key),
+                gemini_model=str(args.gemini_model),
             ),
         )
         result = process_video(

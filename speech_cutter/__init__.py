@@ -2,6 +2,7 @@
 
 from .captions import CaptionSettings
 from .pipeline import (
+    AudioBoostSettings,
     CropSettings,
     NoSpeechDetectedError,
     ProcessingOptions,
@@ -17,6 +18,7 @@ from .presets import PRESETS, build_options
 __all__ = [
     "NoSpeechDetectedError",
     "PRESETS",
+    "AudioBoostSettings",
     "CaptionSettings",
     "CropSettings",
     "ProcessingOptions",

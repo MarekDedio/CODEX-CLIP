@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import Callable
+import json
 import math
 import os
 import subprocess
@@ -11,9 +13,23 @@ import tempfile
 import threading
 import tkinter as tk
 
+import customtkinter as ctk
+
 from .captions import CaptionSettings
+from .credentials import (
+    GEMINI_CREDENTIAL_TARGET,
+    GROQ_CORRECTION_CREDENTIAL_TARGET,
+    GROQ_CORRECTION_CREDENTIAL_TARGETS,
+    GROQ_CREDENTIAL_TARGET,
+    delete_api_key,
+    load_api_key,
+    save_api_key,
+)
 from .pipeline import (
+    AudioBoostSettings,
+    BackgroundMusicSettings,
     CropSettings,
+    DEFAULT_BACKGROUND_MUSIC_PATH,
     DEFAULT_MID_ZOOM_MIN_SEGMENT_SECONDS,
     DEFAULT_PUSH_IN_MAX_ZOOM,
     DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS,
@@ -27,24 +43,31 @@ from .pipeline import (
     probe_video_metadata,
     process_video,
 )
+from .modern_ui import build_main_layout
 from .presets import PRESETS, build_options
 
 
 NATURAL_SETTINGS = PRESETS["natural"].settings
 PREVIEW_FRAME_TIMEOUT_SECONDS = 20.0
-APP_BG = "#0f172a"
-APP_PANEL = "#111827"
-CARD_BG = "#f8fafc"
-CARD_INNER_BG = "#f8fafc"
+APP_BG = "#f3f6fb"
+APP_PANEL = "#0b1220"
+CARD_BG = "#ffffff"
+CARD_INNER_BG = "#ffffff"
 TEXT_DARK = "#0f172a"
 TEXT_MUTED = "#526070"
 TEXT_LIGHT = "#e5eefb"
 TEXT_LIGHT_MUTED = "#94a3b8"
-ACCENT = "#2563eb"
-ACCENT_HOVER = "#1d4ed8"
-ACCENT_SOFT = "#dbeafe"
-BORDER = "#d7dde8"
+ACCENT = "#4f46e5"
+ACCENT_HOVER = "#4338ca"
+ACCENT_SOFT = "#e0e7ff"
+BORDER = "#dce3ee"
 DANGER = "#dc2626"
+DEFAULT_BACKGROUND_MUSIC_VOLUME_PERCENT = 18.0
+DEFAULT_AUDIO_BOOST_GAIN_DB = 6.0
+APP_SETTINGS_NAME = "settings.json"
+LOCAL_TRANSCRIPTION_LABEL = "Local Whisper"
+GROQ_TRANSCRIPTION_LABEL = "Groq API"
+_APP_SETTINGS_CACHE: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +100,58 @@ class BatchFailure:
 class BatchRunResult:
     results: list[ProcessingResult]
     failures: list[BatchFailure]
+
+
+def _settings_path() -> Path:
+    if os.name == "nt":
+        root = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return root / "Speech Cutter" / APP_SETTINGS_NAME
+    return Path.home() / ".config" / "speech-cutter" / APP_SETTINGS_NAME
+
+
+def _load_app_settings() -> dict[str, object]:
+    global _APP_SETTINGS_CACHE
+    if _APP_SETTINGS_CACHE is not None:
+        return dict(_APP_SETTINGS_CACHE)
+    path = _settings_path()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        _APP_SETTINGS_CACHE = {}
+        return {}
+    _APP_SETTINGS_CACHE = payload if isinstance(payload, dict) else {}
+    return dict(_APP_SETTINGS_CACHE)
+
+
+def _save_app_settings(settings: dict[str, object]) -> None:
+    global _APP_SETTINGS_CACHE
+    _APP_SETTINGS_CACHE = dict(settings)
+    path = _settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(settings, handle, indent=2, sort_keys=True)
+    except OSError:
+        pass
+
+
+def _read_saved_background_music_volume_percent() -> float:
+    settings = _load_app_settings()
+    value = settings.get("background_music_volume_percent")
+    try:
+        return min(100.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_BACKGROUND_MUSIC_VOLUME_PERCENT
+
+
+def _read_saved_audio_boost_gain_db() -> float:
+    settings = _load_app_settings()
+    value = settings.get("audio_boost_gain_db")
+    try:
+        return min(24.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_AUDIO_BOOST_GAIN_DB
 
 
 class PreviewLoadingDialog(tk.Toplevel):
@@ -193,7 +268,7 @@ def _extract_preview_frame(
     raise RuntimeError(f"Could not load a frame preview for {input_path.name}.")
 
 
-class CropSelectionDialog(tk.Toplevel):
+class _CropSelectionDialogBase(tk.Toplevel):
     def __init__(
         self,
         parent: tk.Misc,
@@ -257,6 +332,397 @@ class CropSelectionDialog(tk.Toplevel):
         except tk.TclError:
             pass
 
+
+class _MainWindowLayout:
+    def _build_main_app_layout(self) -> None:
+        shell = ttk.Frame(self, style="Root.TFrame")
+        shell.pack(fill="both", expand=True)
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(0, weight=1)
+
+        self._scroll_canvas = tk.Canvas(shell, bg=APP_BG, highlightthickness=0, borderwidth=0)
+        self._scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        self._scrollbar = ttk.Scrollbar(shell, orient="vertical", command=self._scroll_canvas.yview)
+        self._scrollbar.grid(row=0, column=1, sticky="ns")
+        self._scroll_canvas.configure(yscrollcommand=self._scrollbar.set)
+
+        root = ttk.Frame(self._scroll_canvas, style="Root.TFrame", padding=(28, 22, 28, 28))
+        self._scroll_window_id = self._scroll_canvas.create_window((0, 0), window=root, anchor="nw")
+        root.bind("<Configure>", self._on_scroll_frame_configure)
+        self._scroll_canvas.bind("<Configure>", self._on_scroll_canvas_configure)
+        root.bind("<Enter>", self._bind_mousewheel)
+        root.bind("<Leave>", self._unbind_mousewheel)
+        self._scroll_canvas.bind("<Enter>", self._bind_mousewheel)
+        self._scroll_canvas.bind("<Leave>", self._unbind_mousewheel)
+        root.columnconfigure(0, weight=1)
+
+        hero = ttk.Frame(root, style="Hero.TFrame")
+        hero.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        hero.columnconfigure(0, weight=1)
+        ttk.Label(hero, text="VIDEO WORKFLOW", style="Eyebrow.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(hero, text="Speech Cutter", style="Title.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(
+            hero,
+            text="Turn raw recordings into polished, captioned clips — in one render.",
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(
+            hero,
+            text="LOCAL + CLOUD",
+            style="Eyebrow.TLabel",
+        ).grid(row=1, column=1, rowspan=2, sticky="e")
+
+        files_card = ttk.Frame(root, style="Card.TFrame", padding=18)
+        files_card.grid(row=1, column=0, sticky="ew", pady=(0, 16))
+        files_card.columnconfigure(0, weight=1)
+        ttk.Label(files_card, text="1  CHOOSE SOURCE", style="Step.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(files_card, text="Video files", style="Section.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 10))
+
+        source_row = ttk.Frame(files_card, style="CardInner.TFrame")
+        source_row.grid(row=2, column=0, sticky="ew")
+        source_row.columnconfigure(0, weight=1)
+        self.input_entry = ttk.Entry(source_row, textvariable=self.input_var)
+        self.input_entry.grid(row=0, column=0, sticky="ew")
+        self.browse_button = ttk.Button(source_row, text="Choose video", command=self._browse_input)
+        self.browse_button.grid(row=0, column=1, padx=(10, 0))
+        self.queue_mode_check = ttk.Checkbutton(
+            source_row,
+            text="Batch mode",
+            variable=self.queue_enabled_var,
+            command=self._toggle_queue_mode,
+        )
+        self.queue_mode_check.grid(row=0, column=2, padx=(14, 0))
+
+        ttk.Label(files_card, textvariable=self.source_info_var, style="Body.TLabel", wraplength=1000).grid(
+            row=3, column=0, sticky="w", pady=(9, 0)
+        )
+        self.queue_frame = ttk.Frame(files_card, style="CardInner.TFrame")
+        self.queue_frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self.queue_frame.columnconfigure(0, weight=1)
+        queue_header = ttk.Frame(self.queue_frame, style="CardInner.TFrame")
+        queue_header.grid(row=0, column=0, sticky="ew")
+        queue_header.columnconfigure(0, weight=1)
+        ttk.Label(queue_header, text="Processing queue", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(queue_header, textvariable=self.queue_summary_var, style="Body.TLabel").grid(row=0, column=1, sticky="e")
+        self.queue_listbox = tk.Listbox(
+            self.queue_frame,
+            height=4,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bg="#f8fafc",
+            fg=TEXT_DARK,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            selectbackground=ACCENT_SOFT,
+            selectforeground=TEXT_DARK,
+            font=("Segoe UI", 10),
+            borderwidth=0,
+        )
+        self.queue_listbox.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.queue_listbox.bind("<<ListboxSelect>>", self._on_queue_selection)
+        queue_actions = ttk.Frame(self.queue_frame, style="CardInner.TFrame")
+        queue_actions.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.remove_queue_button = ttk.Button(queue_actions, text="Remove", command=self._remove_selected_video)
+        self.remove_queue_button.grid(row=0, column=0)
+        self.clear_queue_button = ttk.Button(queue_actions, text="Clear queue", command=self._clear_queue)
+        self.clear_queue_button.grid(row=0, column=1, padx=(8, 0))
+
+        workspace = ttk.Frame(root, style="Root.TFrame")
+        workspace.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+        workspace.columnconfigure(0, weight=1)
+        ttk.Label(workspace, text="2  CUSTOMIZE", style="Eyebrow.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        notebook = ttk.Notebook(workspace, style="Modern.TNotebook")
+        notebook.grid(row=1, column=0, sticky="ew")
+
+        setup_tab = ttk.Frame(notebook, style="Card.TFrame", padding=18)
+        video_tab = ttk.Frame(notebook, style="Card.TFrame", padding=18)
+        audio_tab = ttk.Frame(notebook, style="Card.TFrame", padding=18)
+        notebook.add(setup_tab, text="Setup")
+        notebook.add(video_tab, text="Video")
+        notebook.add(audio_tab, text="Audio")
+        for tab in (setup_tab, video_tab, audio_tab):
+            tab.columnconfigure(0, weight=1, uniform="tab")
+            tab.columnconfigure(1, weight=1, uniform="tab")
+
+        trim_card = ttk.Frame(setup_tab, style="CardInner.TFrame", padding=(4, 2, 18, 4))
+        trim_card.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        trim_card.columnconfigure(0, weight=1)
+        ttk.Label(trim_card, text="Speech cuts", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            trim_card,
+            text="Natural detection removes silence while keeping speech comfortable.",
+            style="Body.TLabel",
+            wraplength=430,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 16))
+        trim_header = ttk.Frame(trim_card, style="CardInner.TFrame")
+        trim_header.grid(row=2, column=0, sticky="ew")
+        trim_header.columnconfigure(0, weight=1)
+        ttk.Label(trim_header, text="Padding around speech", style="Body.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(trim_header, textvariable=self.padding_value_var, style="Status.TLabel").grid(row=0, column=1, sticky="e")
+        self.padding_scale = ttk.Scale(
+            trim_card,
+            from_=0.0,
+            to=3.0,
+            variable=self.padding_seconds_var,
+            command=self._on_padding_scale,
+            style="Accent.Horizontal.TScale",
+        )
+        self.padding_scale.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(
+            trim_card,
+            text="Tip: 0.10–0.25 s sounds natural for short-form clips.",
+            style="Body.TLabel",
+        ).grid(row=4, column=0, sticky="w", pady=(12, 0))
+
+        caption_card = ttk.Frame(setup_tab, style="CardInner.TFrame", padding=(18, 2, 4, 4))
+        caption_card.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
+        caption_card.columnconfigure(0, weight=1)
+        ttk.Label(caption_card, text="Captions & AI", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            caption_card,
+            text="Add highlighted captions",
+            variable=self.captions_enabled_var,
+        ).grid(row=1, column=0, sticky="w", pady=(9, 0))
+        ttk.Checkbutton(
+            caption_card,
+            text="Mute and censor profanity",
+            variable=self.profanity_filter_var,
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        transcription_row = ttk.Frame(caption_card, style="CardInner.TFrame")
+        transcription_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        transcription_row.columnconfigure(1, weight=1)
+        ttk.Label(transcription_row, text="Transcription", style="Body.TLabel").grid(row=0, column=0, sticky="w")
+        self.transcription_combobox = ttk.Combobox(
+            transcription_row,
+            textvariable=self.transcription_provider_var,
+            values=(LOCAL_TRANSCRIPTION_LABEL, GROQ_TRANSCRIPTION_LABEL),
+            state="readonly",
+            width=24,
+        )
+        self.transcription_combobox.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        self.transcription_combobox.bind("<<ComboboxSelected>>", self._update_transcription_controls)
+
+        self.groq_settings_frame = ttk.Frame(caption_card, style="CardInner.TFrame")
+        self.groq_settings_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.groq_settings_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.groq_settings_frame, text="Groq key", style="Body.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self.groq_settings_frame, textvariable=self.groq_api_key_var, show="*", width=28).grid(
+            row=0, column=1, sticky="ew", padx=(10, 0)
+        )
+        ttk.Label(self.groq_settings_frame, text="Model", style="Body.TLabel").grid(row=1, column=0, sticky="w", pady=(7, 0))
+        ttk.Combobox(
+            self.groq_settings_frame,
+            textvariable=self.groq_model_var,
+            values=("whisper-large-v3-turbo", "whisper-large-v3"),
+            state="readonly",
+            width=24,
+        ).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(7, 0))
+        self.polish_check = ttk.Checkbutton(
+            caption_card,
+            text="Force Polish recognition",
+            variable=self.enhanced_polish_recognition_var,
+        )
+        self.polish_check.grid(row=5, column=0, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            caption_card,
+            text="Review transcript with Gemini",
+            variable=self.ai_correction_enabled_var,
+            command=self._update_ai_controls,
+        ).grid(row=6, column=0, sticky="w", pady=(7, 0))
+        self.gemini_settings_frame = ttk.Frame(caption_card, style="CardInner.TFrame")
+        self.gemini_settings_frame.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        self.gemini_settings_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.gemini_settings_frame, text="Gemini key", style="Body.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self.gemini_settings_frame, textvariable=self.gemini_api_key_var, show="*", width=28).grid(
+            row=0, column=1, sticky="ew", padx=(10, 0)
+        )
+        ttk.Label(self.gemini_settings_frame, text="Groq fallback key", style="Body.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(7, 0)
+        )
+        ttk.Entry(self.gemini_settings_frame, textvariable=self.groq_correction_api_key_var, show="*", width=28).grid(
+            row=1, column=1, sticky="ew", padx=(10, 0), pady=(7, 0)
+        )
+        ttk.Checkbutton(
+            caption_card,
+            text="Remember API keys securely",
+            variable=self.remember_api_keys_var,
+        ).grid(row=8, column=0, sticky="w", pady=(7, 0))
+
+        crop_card = ttk.Frame(video_tab, style="CardInner.TFrame", padding=(4, 2, 18, 4))
+        crop_card.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        crop_card.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            crop_card,
+            text="Dynamic crop / zoom",
+            variable=self.crop_enabled_var,
+            command=self._update_crop_state,
+        ).grid(row=0, column=0, sticky="w")
+        crop_actions = ttk.Frame(crop_card, style="CardInner.TFrame")
+        crop_actions.grid(row=1, column=0, sticky="w", pady=(9, 0))
+        self.pick_crop_button = ttk.Button(crop_actions, text="Choose crop", command=self._choose_crop_visually)
+        self.pick_crop_button.grid(row=0, column=0)
+        self.pick_queue_crops_button = ttk.Button(crop_actions, text="Crop entire queue", command=self._choose_crops_for_queue)
+        self.pick_queue_crops_button.grid(row=0, column=1, padx=(8, 0))
+        self.clear_crop_button = ttk.Button(crop_actions, text="Clear", command=self._clear_crop_selection)
+        self.clear_crop_button.grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(crop_card, textvariable=self.crop_summary_var, style="Body.TLabel", wraplength=440).grid(
+            row=2, column=0, sticky="w", pady=(8, 10)
+        )
+
+        def add_slider(parent: ttk.Frame, row: int, label: str, value_var: tk.StringVar, variable: tk.Variable,
+                       start: float, end: float, command: Callable[[str], None]) -> ttk.Scale:
+            header = ttk.Frame(parent, style="CardInner.TFrame")
+            header.grid(row=row, column=0, sticky="ew", pady=(7, 0))
+            header.columnconfigure(0, weight=1)
+            ttk.Label(header, text=label, style="Body.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(header, textvariable=value_var, style="Status.TLabel").grid(row=0, column=1, sticky="e")
+            scale = ttk.Scale(parent, from_=start, to=end, variable=variable, command=command, style="Accent.Horizontal.TScale")
+            scale.grid(row=row + 1, column=0, sticky="ew", pady=(3, 0))
+            return scale
+
+        self.crop_every_scale = add_slider(crop_card, 3, "Apply every Nth speech segment", self.crop_every_value_var,
+                                           self.crop_every_var, 1, 12, self._on_crop_every_scale)
+        self.crop_min_scale = add_slider(crop_card, 5, "Skip segments shorter than", self.crop_min_seconds_value_var,
+                                         self.crop_min_seconds_var, 0.0, 10.0, self._on_crop_min_scale)
+        self.crop_zoom_scale = add_slider(crop_card, 7, "Zoom duration", self.crop_zoom_seconds_value_var,
+                                          self.crop_zoom_seconds_var, 0.0, 10.0, self._on_crop_zoom_scale)
+
+        motion_card = ttk.Frame(video_tab, style="CardInner.TFrame", padding=(18, 2, 4, 4))
+        motion_card.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
+        motion_card.columnconfigure(0, weight=1)
+        ttk.Label(motion_card, text="Motion", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.crop_middle_long_check = ttk.Checkbutton(
+            motion_card,
+            text="Zoom the middle of long segments",
+            variable=self.crop_middle_long_var,
+        )
+        self.crop_middle_long_check.grid(row=1, column=0, sticky="w", pady=(9, 0))
+        self.crop_middle_long_threshold_scale = add_slider(
+            motion_card, 2, "Long segment threshold", self.crop_middle_long_threshold_value_var,
+            self.crop_middle_long_threshold_var, 4.0, 30.0, self._on_crop_middle_long_threshold_scale
+        )
+        ttk.Separator(motion_card, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(14, 7))
+        ttk.Checkbutton(
+            motion_card,
+            text="Smooth push-in on long speech",
+            variable=self.push_in_enabled_var,
+        ).grid(row=5, column=0, sticky="w")
+        self.push_in_min_scale = add_slider(
+            motion_card, 6, "Apply above", self.push_in_min_seconds_value_var,
+            self.push_in_min_seconds_var, 1.0, 30.0, self._on_push_in_min_scale
+        )
+        self.push_in_zoom_scale = add_slider(
+            motion_card, 8, "Final zoom", self.push_in_zoom_percent_value_var,
+            self.push_in_zoom_percent_var, 2.0, 25.0, self._on_push_in_zoom_scale
+        )
+        self._crop_widgets = [
+            self.pick_crop_button, self.pick_queue_crops_button, self.clear_crop_button,
+            self.crop_every_scale, self.crop_min_scale, self.crop_zoom_scale,
+            self.crop_middle_long_check, self.crop_middle_long_threshold_scale,
+        ]
+
+        music_card = ttk.Frame(audio_tab, style="CardInner.TFrame", padding=(4, 2, 18, 4))
+        music_card.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        music_card.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            music_card,
+            text="Background music",
+            variable=self.background_music_enabled_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            music_card,
+            text="Loop Monkeys Spinning Monkeys beneath the original speech.",
+            style="Body.TLabel",
+            wraplength=430,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 8))
+        self.background_music_volume_scale = add_slider(
+            music_card, 2, "Music volume", self.background_music_volume_value_var,
+            self.background_music_volume_percent_var, 0.0, 100.0, self._on_background_music_volume_scale
+        )
+
+        boost_card = ttk.Frame(audio_tab, style="CardInner.TFrame", padding=(18, 2, 4, 4))
+        boost_card.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
+        boost_card.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            boost_card,
+            text="Boost speech volume",
+            variable=self.audio_boost_enabled_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            boost_card,
+            text="Increase loudness with a limiter that protects against clipping.",
+            style="Body.TLabel",
+            wraplength=430,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 8))
+        self.audio_boost_scale = add_slider(
+            boost_card, 2, "Gain", self.audio_boost_gain_value_var,
+            self.audio_boost_gain_db_var, 0.0, 24.0, self._on_audio_boost_scale
+        )
+
+        activity_card = ttk.Frame(root, style="Card.TFrame", padding=18)
+        activity_card.grid(row=3, column=0, sticky="nsew")
+        activity_card.columnconfigure(0, weight=1)
+        actions = ttk.Frame(activity_card, style="CardInner.TFrame")
+        actions.grid(row=0, column=0, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+        ttk.Label(actions, text="3  EXPORT", style="Step.TLabel").grid(row=0, column=0, sticky="w")
+        self.open_folder_button = ttk.Button(actions, text="Open folder", command=self._open_output_folder, state="disabled")
+        self.open_folder_button.grid(row=0, column=1, padx=(8, 0))
+        self.cancel_button = ttk.Button(
+            actions, text="Cancel", style="Danger.TButton", command=self._cancel_processing, state="disabled"
+        )
+        self.cancel_button.grid(row=0, column=2, padx=(8, 0))
+        self.start_button = ttk.Button(
+            actions, text="Create video", style="Primary.TButton", command=self._start_processing
+        )
+        self.start_button.grid(row=0, column=3, padx=(8, 0))
+        ttk.Label(activity_card, textvariable=self.status_var, style="Status.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(12, 6)
+        )
+        ttk.Progressbar(
+            activity_card,
+            style="Accent.Horizontal.TProgressbar",
+            variable=self.progress_var,
+            maximum=100,
+        ).grid(row=2, column=0, sticky="ew")
+        self.log_box = scrolledtext.ScrolledText(
+            activity_card,
+            wrap="word",
+            height=5,
+            relief="flat",
+            bg=APP_PANEL,
+            fg="#dbeafe",
+            insertbackground="#ffffff",
+            selectbackground=ACCENT,
+            selectforeground="#ffffff",
+            font=("Cascadia Mono", 9),
+            padx=12,
+            pady=9,
+            borderwidth=0,
+        )
+        self.log_box.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self.log_box.insert("end", "Ready. Choose a video to begin.\n")
+        self.log_box.configure(state="disabled")
+
+        self._update_transcription_controls()
+        self._update_ai_controls()
+
+    def _update_transcription_controls(self, _event: object | None = None) -> None:
+        if self.transcription_provider_var.get() == GROQ_TRANSCRIPTION_LABEL:
+            self.groq_settings_frame.grid()
+        else:
+            self.groq_settings_frame.grid_remove()
+
+    def _update_ai_controls(self) -> None:
+        if self.ai_correction_enabled_var.get():
+            self.gemini_settings_frame.grid()
+        else:
+            self.gemini_settings_frame.grid_remove()
+
+
+class CropSelectionDialog(_CropSelectionDialogBase):
     def _build_layout(self) -> None:
         frame = ttk.Frame(self, style="Card.TFrame", padding=18)
         frame.pack(fill="both", expand=True)
@@ -477,13 +943,13 @@ class CropSelectionDialog(tk.Toplevel):
     def _clamp_preview_point(self, x: int, y: int) -> tuple[int, int]:
         return max(0, min(x, self._preview_width)), max(0, min(y, self._preview_height))
 
-class SpeechCutterApp(tk.Tk):
+class SpeechCutterApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Speech Cutter")
-        self.geometry("1120x820")
-        self.minsize(980, 700)
-        self.configure(bg=APP_BG)
+        self.geometry("1260x900")
+        self.minsize(1060, 760)
+        self.configure(fg_color="#090D18")
 
         self._worker: threading.Thread | None = None
         self._cancel_event = threading.Event()
@@ -496,13 +962,14 @@ class SpeechCutterApp(tk.Tk):
         self._source_path: Path | None = None
         self._source_metadata: dict[str, int | float | bool | None] = {}
         self._crop_rect: tuple[int, int, int, int] | None = None
+        self._settings_save_after_id: str | None = None
 
         self.input_var = tk.StringVar()
         self.queue_enabled_var = tk.BooleanVar(value=False)
-        self.queue_summary_var = tk.StringVar(value="Queue mode is off.")
-        self.source_info_var = tk.StringVar(value="Pick a video to load its source size.")
-        self.crop_summary_var = tk.StringVar(value="No crop selected.")
-        self.status_var = tk.StringVar(value="Pick a video and press Start.")
+        self.queue_summary_var = tk.StringVar(value="Tryb seryjny jest wyłączony.")
+        self.source_info_var = tk.StringVar(value="Wybierz film, aby odczytać jego parametry.")
+        self.crop_summary_var = tk.StringVar(value="Nie wybrano kadru.")
+        self.status_var = tk.StringVar(value="Wybierz film i rozpocznij eksport.")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.padding_seconds_var = tk.DoubleVar(value=NATURAL_SETTINGS.speech_pad_ms / 1000)
         self.padding_value_var = tk.StringVar()
@@ -524,6 +991,43 @@ class SpeechCutterApp(tk.Tk):
         self.push_in_zoom_percent_value_var = tk.StringVar()
         self.captions_enabled_var = tk.BooleanVar(value=True)
         self.profanity_filter_var = tk.BooleanVar(value=True)
+        self.enhanced_polish_recognition_var = tk.BooleanVar(value=False)
+        self.transcription_provider_var = tk.StringVar(value=GROQ_TRANSCRIPTION_LABEL)
+        self.groq_api_key_var = tk.StringVar(
+            value=os.environ.get("GROQ_API_KEY") or load_api_key(GROQ_CREDENTIAL_TARGET) or ""
+        )
+        self.groq_model_var = tk.StringVar(value="whisper-large-v3-turbo")
+        self.ai_correction_enabled_var = tk.BooleanVar(value=True)
+        self.gemini_api_key_var = tk.StringVar(
+            value=os.environ.get("GEMINI_API_KEY") or load_api_key(GEMINI_CREDENTIAL_TARGET) or ""
+        )
+        self.groq_correction_api_key_var = tk.StringVar(
+            value=(
+                os.environ.get("GROQ_CORRECTION_API_KEY")
+                or load_api_key(GROQ_CORRECTION_CREDENTIAL_TARGET)
+                or ""
+            )
+        )
+        self.groq_correction_extra_api_key_vars = [
+            tk.StringVar(
+                value=(
+                    os.environ.get(f"GROQ_CORRECTION_API_KEY_{index}")
+                    or load_api_key(GROQ_CORRECTION_CREDENTIAL_TARGETS[index - 1])
+                    or ""
+                )
+            )
+            for index in range(2, 7)
+        ]
+        self.groq_correction_model_var = tk.StringVar(value="openai/gpt-oss-20b")
+        self.remember_api_keys_var = tk.BooleanVar(value=True)
+        self.background_music_enabled_var = tk.BooleanVar(value=True)
+        self.background_music_volume_percent_var = tk.DoubleVar(
+            value=_read_saved_background_music_volume_percent()
+        )
+        self.background_music_volume_value_var = tk.StringVar()
+        self.audio_boost_enabled_var = tk.BooleanVar(value=False)
+        self.audio_boost_gain_db_var = tk.DoubleVar(value=_read_saved_audio_boost_gain_db())
+        self.audio_boost_gain_value_var = tk.StringVar()
 
         self.padding_seconds_var.trace_add("write", self._refresh_setting_labels)
         self.crop_every_var.trace_add("write", self._refresh_setting_labels)
@@ -532,6 +1036,8 @@ class SpeechCutterApp(tk.Tk):
         self.crop_middle_long_threshold_var.trace_add("write", self._refresh_setting_labels)
         self.push_in_min_seconds_var.trace_add("write", self._refresh_setting_labels)
         self.push_in_zoom_percent_var.trace_add("write", self._refresh_setting_labels)
+        self.background_music_volume_percent_var.trace_add("write", self._refresh_setting_labels)
+        self.audio_boost_gain_db_var.trace_add("write", self._refresh_setting_labels)
 
         self._configure_styles()
         self._refresh_setting_labels()
@@ -555,9 +1061,12 @@ class SpeechCutterApp(tk.Tk):
         style.configure("AppPanel.TFrame", background=APP_PANEL)
         style.configure("Card.TFrame", background=CARD_BG, relief="flat", borderwidth=1)
         style.configure("CardInner.TFrame", background=CARD_INNER_BG)
-        style.configure("Title.TLabel", background=APP_BG, foreground=TEXT_LIGHT, font=("Segoe UI Semibold", 28))
-        style.configure("Subtitle.TLabel", background=APP_BG, foreground=TEXT_LIGHT_MUTED, font=("Segoe UI", 11))
-        style.configure("Section.TLabel", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI Semibold", 11))
+        style.configure("Hero.TFrame", background=APP_BG)
+        style.configure("Title.TLabel", background=APP_BG, foreground=TEXT_DARK, font=("Segoe UI Semibold", 26))
+        style.configure("Subtitle.TLabel", background=APP_BG, foreground=TEXT_MUTED, font=("Segoe UI", 11))
+        style.configure("Eyebrow.TLabel", background=APP_BG, foreground=ACCENT, font=("Segoe UI Semibold", 9))
+        style.configure("Section.TLabel", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI Semibold", 12))
+        style.configure("Step.TLabel", background=CARD_BG, foreground=ACCENT, font=("Segoe UI Semibold", 9))
         style.configure("Body.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Segoe UI", 10))
         style.configure("Status.TLabel", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI Semibold", 10))
         style.configure(
@@ -577,8 +1086,8 @@ class SpeechCutterApp(tk.Tk):
         )
         style.configure(
             "Primary.TButton",
-            font=("Segoe UI Semibold", 10),
-            padding=(18, 9),
+            font=("Segoe UI Semibold", 11),
+            padding=(22, 11),
             background=ACCENT,
             foreground="#ffffff",
             bordercolor=ACCENT,
@@ -628,6 +1137,25 @@ class SpeechCutterApp(tk.Tk):
             lightcolor=ACCENT,
             darkcolor=ACCENT,
         )
+        style.configure(
+            "Modern.TNotebook",
+            background=APP_BG,
+            borderwidth=0,
+            tabmargins=(0, 0, 0, 12),
+        )
+        style.configure(
+            "Modern.TNotebook.Tab",
+            font=("Segoe UI Semibold", 10),
+            padding=(22, 10),
+            background="#e8edf5",
+            foreground=TEXT_MUTED,
+            borderwidth=0,
+        )
+        style.map(
+            "Modern.TNotebook.Tab",
+            background=[("selected", CARD_BG), ("active", "#eef2ff")],
+            foreground=[("selected", ACCENT), ("active", TEXT_DARK)],
+        )
 
     def _refresh_setting_labels(self, *_args: object) -> None:
         self.padding_value_var.set(f"{float(self.padding_seconds_var.get()):.2f}s")
@@ -638,6 +1166,8 @@ class SpeechCutterApp(tk.Tk):
         self.crop_middle_long_threshold_value_var.set(f"{float(self.crop_middle_long_threshold_var.get()):.1f}s")
         self.push_in_min_seconds_value_var.set(f"{float(self.push_in_min_seconds_var.get()):.1f}s")
         self.push_in_zoom_percent_value_var.set(f"{float(self.push_in_zoom_percent_var.get()):.0f}%")
+        self.background_music_volume_value_var.set(f"{float(self.background_music_volume_percent_var.get()):.0f}%")
+        self.audio_boost_gain_value_var.set(f"+{float(self.audio_boost_gain_db_var.get()):.1f} dB")
 
     def _on_padding_scale(self, value: str) -> None:
         snapped = min(3.0, max(0.0, round(float(value) / 0.05) * 0.05))
@@ -679,6 +1209,31 @@ class SpeechCutterApp(tk.Tk):
         if abs(float(self.push_in_zoom_percent_var.get()) - snapped) > 1e-9:
             self.push_in_zoom_percent_var.set(snapped)
 
+    def _on_background_music_volume_scale(self, value: str) -> None:
+        snapped = min(100.0, max(0.0, round(float(value))))
+        if abs(float(self.background_music_volume_percent_var.get()) - snapped) > 1e-9:
+            self.background_music_volume_percent_var.set(snapped)
+        self._schedule_settings_save()
+
+    def _on_audio_boost_scale(self, value: str) -> None:
+        snapped = min(24.0, max(0.0, round(float(value) / 0.5) * 0.5))
+        snapped = round(snapped, 1)
+        if abs(float(self.audio_boost_gain_db_var.get()) - snapped) > 1e-9:
+            self.audio_boost_gain_db_var.set(snapped)
+        self._schedule_settings_save()
+
+    def _schedule_settings_save(self) -> None:
+        if self._settings_save_after_id is not None:
+            self.after_cancel(self._settings_save_after_id)
+        self._settings_save_after_id = self.after(350, self._persist_ui_settings)
+
+    def _persist_ui_settings(self) -> None:
+        self._settings_save_after_id = None
+        settings = _load_app_settings()
+        settings["background_music_volume_percent"] = float(self.background_music_volume_percent_var.get())
+        settings["audio_boost_gain_db"] = float(self.audio_boost_gain_db_var.get())
+        _save_app_settings(settings)
+
     def _on_scroll_frame_configure(self, _event: tk.Event[tk.Widget] | None = None) -> None:
         self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
 
@@ -697,6 +1252,21 @@ class SpeechCutterApp(tk.Tk):
         self._scroll_canvas.yview_scroll(-int(event.delta / 120), "units")
 
     def _build_layout(self) -> None:
+        build_main_layout(self)
+
+    def _update_transcription_controls(self, _event: object | None = None) -> None:
+        if self.transcription_provider_var.get() == GROQ_TRANSCRIPTION_LABEL:
+            self.groq_settings_frame.grid()
+        else:
+            self.groq_settings_frame.grid_remove()
+
+    def _update_ai_controls(self) -> None:
+        if self.ai_correction_enabled_var.get():
+            self.gemini_settings_frame.grid()
+        else:
+            self.gemini_settings_frame.grid_remove()
+
+    def _build_legacy_layout(self) -> None:
         shell = ttk.Frame(self, style="Root.TFrame")
         shell.pack(fill="both", expand=True)
         shell.columnconfigure(0, weight=1)
@@ -724,7 +1294,7 @@ class SpeechCutterApp(tk.Tk):
 
         root.columnconfigure(0, weight=1, uniform="main")
         root.columnconfigure(1, weight=1, uniform="main")
-        root.rowconfigure(4, weight=1)
+        root.rowconfigure(5, weight=1)
 
         hero = ttk.Frame(root, style="Root.TFrame")
         hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 18))
@@ -1056,18 +1626,166 @@ class SpeechCutterApp(tk.Tk):
             text="Mute profanity automatically",
             variable=self.profanity_filter_var,
         ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+        transcription_row = ttk.Frame(caption_card, style="CardInner.TFrame")
+        transcription_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        transcription_row.columnconfigure(1, weight=1)
+        ttk.Label(transcription_row, text="Transcription engine:", style="Body.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            transcription_row,
+            textvariable=self.transcription_provider_var,
+            values=(LOCAL_TRANSCRIPTION_LABEL, GROQ_TRANSCRIPTION_LABEL),
+            state="readonly",
+            width=25,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        groq_key_row = ttk.Frame(caption_card, style="CardInner.TFrame")
+        groq_key_row.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        groq_key_row.columnconfigure(1, weight=1)
+        ttk.Label(groq_key_row, text="Groq API key:", style="Body.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(groq_key_row, textvariable=self.groq_api_key_var, show="*", width=32).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
+        )
+
+        groq_model_row = ttk.Frame(caption_card, style="CardInner.TFrame")
+        groq_model_row.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        groq_model_row.columnconfigure(1, weight=1)
+        ttk.Label(groq_model_row, text="Groq model:", style="Body.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            groq_model_row,
+            textvariable=self.groq_model_var,
+            values=("whisper-large-v3-turbo", "whisper-large-v3"),
+            state="readonly",
+            width=25,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        ttk.Checkbutton(
+            caption_card,
+            text="Force Polish recognition (local mode uses larger model)",
+            variable=self.enhanced_polish_recognition_var,
+        ).grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            caption_card,
+            text="Check transcript logic with Gemini AI",
+            variable=self.ai_correction_enabled_var,
+        ).grid(row=7, column=0, sticky="w", pady=(8, 0))
+        gemini_key_row = ttk.Frame(caption_card, style="CardInner.TFrame")
+        gemini_key_row.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        gemini_key_row.columnconfigure(1, weight=1)
+        ttk.Label(gemini_key_row, text="Gemini API key:", style="Body.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(gemini_key_row, textvariable=self.gemini_api_key_var, show="*", width=32).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
+        )
+        groq_fallback_key_row = ttk.Frame(caption_card, style="CardInner.TFrame")
+        groq_fallback_key_row.grid(row=9, column=0, sticky="ew", pady=(8, 0))
+        groq_fallback_key_row.columnconfigure(1, weight=1)
+        ttk.Label(groq_fallback_key_row, text="Groq fallback API key:", style="Body.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Entry(groq_fallback_key_row, textvariable=self.groq_correction_api_key_var, show="*", width=32).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
+        )
+        ttk.Checkbutton(
+            caption_card,
+            text="Remember API keys securely in Windows Credential Manager",
+            variable=self.remember_api_keys_var,
+        ).grid(row=10, column=0, sticky="w", pady=(8, 0))
         ttk.Label(
             caption_card,
             text=(
                 "Subtitles are baked into the video with bold lower-third captions and a live highlighted word. "
-                "The first run may download the speech-to-text model."
+                "Local Whisper runs offline; Groq uploads compressed audio and avoids local model processing. "
+                "Forcing Polish uses a larger model locally or locks the Groq language to Polish. "
+                "Gemini correction reviews the transcript before subtitles are generated. Remembered keys are "
+                "stored in Windows Credential Manager, not in the app settings file."
             ),
+            style="Body.TLabel",
+            wraplength=470,
+        ).grid(row=11, column=0, sticky="w", pady=(12, 0))
+
+        music_card = ttk.Frame(root, style="Card.TFrame", padding=20)
+        music_card.grid(row=4, column=1, sticky="new", padx=(8, 0), pady=(0, 16))
+        music_card.columnconfigure(0, weight=1)
+
+        ttk.Checkbutton(
+            music_card,
+            text="Add Monkeys Spinning Monkeys background music",
+            variable=self.background_music_enabled_var,
+        ).grid(row=0, column=0, sticky="w")
+
+        music_volume_header = ttk.Frame(music_card, style="CardInner.TFrame")
+        music_volume_header.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        music_volume_header.columnconfigure(0, weight=1)
+        ttk.Label(music_volume_header, text="Music Volume", style="Section.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        ttk.Label(
+            music_volume_header,
+            textvariable=self.background_music_volume_value_var,
+            style="Body.TLabel",
+        ).grid(row=0, column=1, sticky="e")
+        self.background_music_volume_scale = ttk.Scale(
+            music_card,
+            from_=0.0,
+            to=100.0,
+            variable=self.background_music_volume_percent_var,
+            command=self._on_background_music_volume_scale,
+            style="Accent.Horizontal.TScale",
+        )
+        self.background_music_volume_scale.grid(row=2, column=0, sticky="ew")
+        ttk.Label(
+            music_card,
+            text="The music loops for the full exported clip and is mixed under the original speech audio.",
             style="Body.TLabel",
             wraplength=470,
         ).grid(row=3, column=0, sticky="w", pady=(12, 0))
 
+        ttk.Separator(music_card, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(16, 0))
+
+        ttk.Checkbutton(
+            music_card,
+            text="Boost speech volume",
+            variable=self.audio_boost_enabled_var,
+        ).grid(row=5, column=0, sticky="w", pady=(12, 0))
+
+        audio_boost_header = ttk.Frame(music_card, style="CardInner.TFrame")
+        audio_boost_header.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        audio_boost_header.columnconfigure(0, weight=1)
+        ttk.Label(audio_boost_header, text="Boost Amount", style="Section.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        ttk.Label(
+            audio_boost_header,
+            textvariable=self.audio_boost_gain_value_var,
+            style="Body.TLabel",
+        ).grid(row=0, column=1, sticky="e")
+        self.audio_boost_scale = ttk.Scale(
+            music_card,
+            from_=0.0,
+            to=24.0,
+            variable=self.audio_boost_gain_db_var,
+            command=self._on_audio_boost_scale,
+            style="Accent.Horizontal.TScale",
+        )
+        self.audio_boost_scale.grid(row=7, column=0, sticky="ew")
+        ttk.Label(
+            music_card,
+            text=(
+                "Raises the speech volume and applies a limiter so it gets louder without clipping "
+                "or distorting."
+            ),
+            style="Body.TLabel",
+            wraplength=470,
+        ).grid(row=8, column=0, sticky="w", pady=(12, 0))
+
         activity_card = ttk.Frame(root, style="Card.TFrame", padding=20)
-        activity_card.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        activity_card.grid(row=5, column=0, columnspan=2, sticky="nsew")
         activity_card.columnconfigure(0, weight=1)
         activity_card.rowconfigure(4, weight=1)
 
@@ -1175,15 +1893,18 @@ class SpeechCutterApp(tk.Tk):
         is_queue_mode = bool(self.queue_enabled_var.get())
         self.input_entry.configure(state="readonly" if is_queue_mode else "normal")
         self.pick_crop_button.configure(
-            text="Choose Crop For Selected Video..." if is_queue_mode else "Choose Crop Visually..."
+            text="Kadr wybranego filmu" if is_queue_mode else "Wybierz kadr"
         )
-        self.clear_crop_button.configure(text="Clear Selected Crop" if is_queue_mode else "Clear Crop")
+        self.clear_crop_button.configure(text="Wyczyść wybrany" if is_queue_mode else "Wyczyść")
         if is_queue_mode:
             self.queue_frame.grid()
             self.pick_queue_crops_button.grid()
         else:
             self.queue_frame.grid_remove()
             self.pick_queue_crops_button.grid_remove()
+        if hasattr(self, "footer_panel"):
+            self.footer_panel.lift()
+            self.after_idle(self.footer_panel.lift)
         self._update_crop_state()
 
     def _set_queued_videos(self, paths: list[Path]) -> None:
@@ -1253,17 +1974,15 @@ class SpeechCutterApp(tk.Tk):
             self._queue_refreshing = False
 
         if not self._queued_videos:
-            self.queue_summary_var.set("No queued videos.")
+            self.queue_summary_var.set("Kolejka jest pusta.")
             return
 
         crop_count = sum(1 for video in self._queued_videos if video.crop_rect is not None)
         video_count = len(self._queued_videos)
-        video_word = "video" if video_count == 1 else "videos"
-        crop_word = "crop" if crop_count == 1 else "crops"
-        self.queue_summary_var.set(f"{video_count} {video_word} queued, {crop_count} {crop_word} ready.")
+        self.queue_summary_var.set(f"Filmy: {video_count}  •  gotowe kadry: {crop_count}")
 
     def _format_queue_entry(self, video: QueuedVideo, index: int) -> str:
-        crop_status = "crop ready" if video.crop_rect else "no crop"
+        crop_status = "kadr gotowy" if video.crop_rect else "bez kadru"
         return f"{index + 1}. {video.path.name}  [{crop_status}]"
 
     def _on_queue_selection(self, _event: tk.Event[tk.Listbox]) -> None:
@@ -1344,37 +2063,37 @@ class SpeechCutterApp(tk.Tk):
     def _update_source_info_for_video(self, video: QueuedVideo) -> None:
         position_prefix = ""
         if self.queue_enabled_var.get() and len(self._queued_videos) > 1:
-            position_prefix = f"Video {self._selected_queue_index + 1} of {len(self._queued_videos)}. "
+            position_prefix = f"Film {self._selected_queue_index + 1} z {len(self._queued_videos)}. "
 
         if not video.metadata:
-            self.source_info_var.set(position_prefix + "Pick a video to load its source size.")
+            self.source_info_var.set(position_prefix + "Wybierz film, aby odczytać jego parametry.")
             return
 
         width = int(video.metadata.get("video_width") or 0)
         height = int(video.metadata.get("video_height") or 0)
         if width > 0 and height > 0:
             self.source_info_var.set(
-                position_prefix + f"Source size: {width} x {height}. Crop is chosen visually from a frame preview."
+                position_prefix + f"Rozdzielczość: {width} × {height}. Kadr wybierzesz bezpośrednio na podglądzie."
             )
         else:
-            self.source_info_var.set(position_prefix + "Source size could not be read from this file.")
+            self.source_info_var.set(position_prefix + "Nie udało się odczytać rozdzielczości tego pliku.")
 
     def _update_crop_summary_for_video(self, video: QueuedVideo | None) -> None:
         if video is None:
-            self.crop_summary_var.set("No crop selected.")
+            self.crop_summary_var.set("Nie wybrano kadru.")
             return
 
         prefix = ""
         if self.queue_enabled_var.get() and len(self._queued_videos) > 1:
-            prefix = f"Video {self._selected_queue_index + 1} of {len(self._queued_videos)}. "
+            prefix = f"Film {self._selected_queue_index + 1} z {len(self._queued_videos)}. "
 
         if video.crop_rect is None:
-            self.crop_summary_var.set(prefix + "No crop selected.")
+            self.crop_summary_var.set(prefix + "Nie wybrano kadru.")
             return
 
         x, y, crop_width, crop_height = video.crop_rect
         self.crop_summary_var.set(
-            prefix + f"Crop selected: x={x}, y={y}, width={crop_width}, height={crop_height}"
+            prefix + f"Kadr: x={x}, y={y}, szerokość={crop_width}, wysokość={crop_height}"
         )
 
     def _clear_active_video_state(self, *, clear_input: bool) -> None:
@@ -1383,8 +2102,8 @@ class SpeechCutterApp(tk.Tk):
         self._source_path = None
         self._source_metadata = {}
         self._crop_rect = None
-        self.source_info_var.set("Pick a video to load its source size.")
-        self.crop_summary_var.set("No crop selected.")
+        self.source_info_var.set("Wybierz film, aby odczytać jego parametry.")
+        self.crop_summary_var.set("Nie wybrano kadru.")
         self._update_crop_state()
 
     def _ensure_single_video_selection(self) -> QueuedVideo | None:
@@ -1611,8 +2330,13 @@ class SpeechCutterApp(tk.Tk):
             crop_middle_long_threshold_seconds = max(0.0, float(self.crop_middle_long_threshold_var.get()))
             push_in_min_seconds = max(0.0, float(self.push_in_min_seconds_var.get()))
             push_in_max_zoom = 1.0 + max(0.0, float(self.push_in_zoom_percent_var.get())) / 100.0
+            background_music_volume = min(
+                1.0,
+                max(0.0, float(self.background_music_volume_percent_var.get()) / 100.0),
+            )
+            audio_boost_gain_db = min(24.0, max(0.0, float(self.audio_boost_gain_db_var.get())))
         except (tk.TclError, ValueError):
-            messagebox.showerror("Invalid settings", "One of the trim, crop, or motion settings is not valid.")
+            messagebox.showerror("Invalid settings", "One of the trim, crop, motion, or music settings is not valid.")
             return None
 
         if self.queue_enabled_var.get():
@@ -1650,9 +2374,77 @@ class SpeechCutterApp(tk.Tk):
         if existing_outputs and not self._confirm_output_overwrite(existing_outputs):
             return None
 
+        gemini_api_key = self.gemini_api_key_var.get().strip()
+        groq_api_key = self.groq_api_key_var.get().strip()
+        groq_correction_api_key = self.groq_correction_api_key_var.get().strip()
+        groq_correction_api_keys = tuple(
+            api_key_var.get().strip() for api_key_var in self.groq_correction_extra_api_key_vars
+        )
+        transcription_provider = (
+            "groq" if self.transcription_provider_var.get() == GROQ_TRANSCRIPTION_LABEL else "local"
+        )
+        if (
+            transcription_provider == "groq"
+            and (self.captions_enabled_var.get() or self.profanity_filter_var.get())
+            and not groq_api_key
+        ):
+            messagebox.showerror(
+                "Missing Groq API key",
+                "Enter your Groq API key or set the GROQ_API_KEY environment variable.",
+            )
+            return None
+        if self.ai_correction_enabled_var.get() and not self.captions_enabled_var.get():
+            messagebox.showerror("Invalid settings", "Enable burned-in subtitles to use Gemini transcript correction.")
+            return None
+        if self.ai_correction_enabled_var.get() and not gemini_api_key:
+            messagebox.showerror(
+                "Missing Gemini API key",
+                "Enter your Gemini API key or set the GEMINI_API_KEY environment variable.",
+            )
+            return None
+
+        if self.remember_api_keys_var.get():
+            groq_saved = (
+                save_api_key(GROQ_CREDENTIAL_TARGET, groq_api_key)
+                if groq_api_key
+                else delete_api_key(GROQ_CREDENTIAL_TARGET)
+            )
+            gemini_saved = (
+                save_api_key(GEMINI_CREDENTIAL_TARGET, gemini_api_key)
+                if gemini_api_key
+                else delete_api_key(GEMINI_CREDENTIAL_TARGET)
+            )
+            correction_keys = (groq_correction_api_key, *groq_correction_api_keys)
+            groq_correction_saved = all(
+                save_api_key(target, key) if key else delete_api_key(target)
+                for target, key in zip(GROQ_CORRECTION_CREDENTIAL_TARGETS, correction_keys)
+            )
+            keys_saved = groq_saved and gemini_saved and groq_correction_saved
+            if not keys_saved:
+                messagebox.showwarning(
+                    "Could not remember API key",
+                    "Processing will continue, but Windows Credential Manager could not save one of the API keys.",
+                )
+        else:
+            delete_api_key(GROQ_CREDENTIAL_TARGET)
+            delete_api_key(GEMINI_CREDENTIAL_TARGET)
+            for target in GROQ_CORRECTION_CREDENTIAL_TARGETS:
+                delete_api_key(target)
+
         caption_settings = CaptionSettings(
             enabled=bool(self.captions_enabled_var.get()),
             profanity_filter=bool(self.profanity_filter_var.get()),
+            enhanced_polish_recognition=bool(self.enhanced_polish_recognition_var.get()),
+            transcription_provider=transcription_provider,
+            groq_api_key=groq_api_key,
+            groq_model=self.groq_model_var.get().strip() or "whisper-large-v3-turbo",
+            ai_correction_enabled=bool(self.ai_correction_enabled_var.get()),
+            gemini_api_key=gemini_api_key,
+            groq_correction_api_key=groq_correction_api_key,
+            groq_correction_api_keys=groq_correction_api_keys,
+            groq_correction_model=(
+                self.groq_correction_model_var.get().strip() or "openai/gpt-oss-20b"
+            ),
         )
 
         jobs: list[ProcessingJob] = []
@@ -1675,6 +2467,15 @@ class SpeechCutterApp(tk.Tk):
                 push_in_min_segment_seconds=push_in_min_seconds,
                 push_in_max_zoom=push_in_max_zoom,
             )
+            background_music_settings = BackgroundMusicSettings(
+                enabled=bool(self.background_music_enabled_var.get()),
+                path=DEFAULT_BACKGROUND_MUSIC_PATH,
+                volume=background_music_volume,
+            )
+            audio_boost_settings = AudioBoostSettings(
+                enabled=bool(self.audio_boost_enabled_var.get()),
+                gain_db=audio_boost_gain_db,
+            )
             jobs.append(
                 ProcessingJob(
                     input_path=video.path,
@@ -1685,6 +2486,8 @@ class SpeechCutterApp(tk.Tk):
                         merge_gap_ms=NATURAL_SETTINGS.merge_gap_ms,
                         crop=crop_settings,
                         motion=motion_settings,
+                        background_music=background_music_settings,
+                        audio_boost=audio_boost_settings,
                         captions=caption_settings,
                     ),
                 )

@@ -11,9 +11,15 @@ Speech Cutter is a small desktop app that loads a video, finds the parts with hu
 - Uses the natural trim profile by default, with a simple padding control in seconds.
 - Can optionally crop selected segments with a visual frame picker that stays locked to the original video aspect ratio.
 - Can add a slow center push-in to longer speech segments for subtle visual motion.
+- Adds looped "Monkeys Spinning Monkeys" background music by default, with a checkbox to turn it off and a remembered volume slider.
 - Can burn in TikTok-style subtitles with a highlighted active word.
+- Offers an optional enhanced Polish recognition mode using a larger speech-to-text model and Polish-specific decoding.
+- Supports either local Whisper or Groq API transcription (`whisper-large-v3-turbo` / `whisper-large-v3`) with word timestamps.
+- Can send the transcript through Gemini before subtitle generation to correct clear recognition and logical-context errors without changing word timing.
 - Can automatically mute detected profanity and censor it in the subtitles.
-- Runs in a simple Windows-friendly Tkinter GUI and also supports a CLI mode.
+- Uses a responsive dark interface built with CustomTkinter, with separate preparation, video, and audio workspaces.
+- Runs cuts, crop/motion effects, captions, music, profanity muting, and audio limiting in one optimized FFmpeg render.
+- Also supports a CLI mode.
 
 ## Requirements
 
@@ -46,7 +52,21 @@ python -m venv .venv
 ## CLI example
 
 ```powershell
-.\.venv\Scripts\python app.py input.mp4 --padding-seconds 0.18 --push-in --captions --profanity-filter
+.\.venv\Scripts\python app.py input.mp4 --padding-seconds 0.18 --push-in --captions --profanity-filter --enhanced-polish-recognition
+```
+
+To enable Gemini correction, enter the key in the masked GUI field or set it for the current terminal session:
+
+```powershell
+$env:GEMINI_API_KEY="your-key"
+.\.venv\Scripts\python app.py input.mp4 --captions --ai-transcript-correction
+```
+
+To use Groq instead of running Whisper locally:
+
+```powershell
+$env:GROQ_API_KEY="your-key"
+.\.venv\Scripts\python app.py input.mp4 --captions --transcription-provider groq
 ```
 
 ## Notes
@@ -54,7 +74,12 @@ python -m venv .venv
 - The exported file is always MP4 for wide compatibility.
 - Very noisy videos can still produce occasional false positives or false negatives.
 - The first run may take a little longer while dependencies install.
-- Subtitle timing comes from a Whisper speech-to-text pass after trimming, so caption-enabled runs take longer than plain cutting.
+- Whisper analyzes the clean source speech before music is mixed in, and word timings are remapped onto the trimmed timeline.
+- Caption-enabled exports are encoded only once; subtitles and audio effects no longer require a second video render.
+- Enhanced Polish recognition is opt-in. Its larger model is slower on CPU and downloads separately on first use.
+- Gemini correction is opt-in and sends the transcript text (not the video or audio) to the Gemini API.
+- Groq transcription is opt-in and uploads compressed mono FLAC audio. Local Whisper remains the default and works offline.
+- The GUI can remember Groq and Gemini API keys securely in Windows Credential Manager; keys are not written to the app's JSON settings.
 
 ## Third-party component
 
@@ -62,3 +87,8 @@ This app bundles the official Silero VAD 16 kHz ONNX model under the MIT license
 
 - Repo: [snakers4/silero-vad](https://github.com/snakers4/silero-vad)
 - License copy: [third_party_licenses/Silero-VAD-LICENSE.txt](C:\Users\Marel\Desktop\CODEX CLIP\third_party_licenses\Silero-VAD-LICENSE.txt)
+
+It also bundles "Monkeys Spinning Monkeys" by Kevin MacLeod for optional background music.
+
+- Source: [incompetech](https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1400011)
+- License copy: [third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt](C:\Users\Marel\Desktop\CODEX CLIP\third_party_licenses\Monkeys-Spinning-Monkeys-LICENSE.txt)

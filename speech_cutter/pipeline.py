@@ -24,9 +24,12 @@ from .vad import (
 
 
 MODEL_PATH = Path(__file__).resolve().parent / "assets" / "silero_vad_16k_op15.onnx"
+DEFAULT_BACKGROUND_MUSIC_PATH = Path(__file__).resolve().parent / "assets" / "monkeys_spinning_monkeys.mp3"
 DEFAULT_MID_ZOOM_MIN_SEGMENT_SECONDS = 5.0
 DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS = 4.0
 DEFAULT_PUSH_IN_MAX_ZOOM = 1.08
+_VAD_DETECTOR_CACHE: SileroOnnxVad | None = None
+_NVENC_AVAILABLE_CACHE: bool | None = None
 
 
 class ProcessingError(RuntimeError):
@@ -46,6 +49,8 @@ class ProcessingOptions:
     vad: VadSettings = field(default_factory=VadSettings)
     crop: "CropSettings" = field(default_factory=lambda: CropSettings())
     motion: "MotionSettings" = field(default_factory=lambda: MotionSettings())
+    background_music: "BackgroundMusicSettings" = field(default_factory=lambda: BackgroundMusicSettings())
+    audio_boost: "AudioBoostSettings" = field(default_factory=lambda: AudioBoostSettings())
     captions: CaptionSettings = field(default_factory=CaptionSettings)
     video_crf: int = 18
     video_preset: str = "veryfast"
@@ -70,6 +75,19 @@ class MotionSettings:
     push_in_enabled: bool = False
     push_in_min_segment_seconds: float = DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS
     push_in_max_zoom: float = DEFAULT_PUSH_IN_MAX_ZOOM
+
+
+@dataclass(frozen=True)
+class BackgroundMusicSettings:
+    enabled: bool = False
+    path: Path = DEFAULT_BACKGROUND_MUSIC_PATH
+    volume: float = 0.18
+
+
+@dataclass(frozen=True)
+class AudioBoostSettings:
+    enabled: bool = False
+    gain_db: float = 6.0
 
 
 @dataclass(frozen=True)
@@ -101,6 +119,13 @@ def check_runtime() -> list[str]:
     if not MODEL_PATH.exists():
         issues.append(f"Speech model is missing: {MODEL_PATH}")
     return issues
+
+
+def _get_vad_detector() -> SileroOnnxVad:
+    global _VAD_DETECTOR_CACHE
+    if _VAD_DETECTOR_CACHE is None:
+        _VAD_DETECTOR_CACHE = SileroOnnxVad(MODEL_PATH)
+    return _VAD_DETECTOR_CACHE
 
 
 def build_output_path(input_path: Path) -> Path:
@@ -137,7 +162,9 @@ def process_video(
         temp_dir_path = Path(temp_dir)
         wav_path = temp_dir_path / "audio.wav"
         filter_script_path = temp_dir_path / "speech_concat.ffscript"
-        base_render_path = output_path if not needs_transcription(options.captions) else temp_dir_path / "trimmed_base.mp4"
+        transcription_needed = needs_transcription(options.captions)
+        extraction_end = 0.16 if transcription_needed else 0.20
+        detection_end = 0.42 if transcription_needed else 0.55
 
         _log(log_callback, "Extracting mono 16 kHz audio for speech detection.")
         _run_ffmpeg_with_progress(
@@ -166,14 +193,14 @@ def process_video(
             ],
             total_duration=max(metadata["duration"], 0.001),
             progress_start=0.02,
-            progress_end=0.20,
+            progress_end=extraction_end,
             status="Extracting audio...",
             progress_callback=progress_callback,
             cancel_callback=cancel_callback,
         )
 
         _log(log_callback, "Running speech detection with the bundled Silero VAD model.")
-        detector = SileroOnnxVad(MODEL_PATH)
+        detector = _get_vad_detector()
         try:
             segments = detect_speech_in_wav(
                 wav_path,
@@ -181,7 +208,7 @@ def process_video(
                 options.vad,
                 progress_callback=lambda ratio: _emit_progress(
                     progress_callback,
-                    0.20 + ratio * 0.40,
+                    extraction_end + ratio * (detection_end - extraction_end),
                     "Detecting spoken sections...",
                 ),
                 cancel_callback=cancel_callback,
@@ -192,7 +219,9 @@ def process_video(
         if not segments:
             raise NoSpeechDetectedError("No human speech was detected in that video.")
 
-        frame_boundaries = _probe_video_frame_boundaries(input_path, float(metadata["duration"]))
+        frame_boundaries: list[float] = []
+        if bool(metadata.get("is_vfr")):
+            frame_boundaries = _probe_video_frame_boundaries(input_path, float(metadata["duration"]))
         if frame_boundaries:
             segments = _align_segments_to_frame_boundaries(
                 segments,
@@ -219,12 +248,47 @@ def process_video(
             video_height=_as_int(metadata.get("video_height")),
         )
         motion_settings = _prepare_motion_settings(options.motion)
+        background_music_settings = _prepare_background_music_settings(options.background_music)
+        audio_boost_settings = _prepare_audio_boost_settings(options.audio_boost)
 
         kept_duration = sum(segment.duration for segment in segments)
         _log(
             log_callback,
             f"Detected {len(segments)} speech segment(s). Keeping {kept_duration:.1f}s out of {metadata['duration']:.1f}s.",
         )
+        if background_music_settings is not None:
+            _log(
+                log_callback,
+                f"Adding looped background music at {background_music_settings.volume * 100:.0f}% volume.",
+            )
+        if audio_boost_settings is not None:
+            _log(
+                log_callback,
+                f"Boosting speech volume by {audio_boost_settings.gain_db:.1f} dB.",
+            )
+
+        artifacts = CaptionArtifactResult(
+            subtitle_path=None,
+            profanity_intervals=[],
+            caption_event_count=0,
+            censored_word_count=0,
+            transcribed_word_count=0,
+        )
+        if transcription_needed:
+            _ensure_not_cancelled(cancel_callback)
+            artifacts = _create_caption_artifacts(
+                wav_path,
+                temp_dir_path,
+                options=options,
+                metadata=metadata,
+                segments=segments,
+                kept_duration=kept_duration,
+                progress_start=detection_end,
+                progress_end=0.65,
+                progress_callback=progress_callback,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
 
         filter_script_path.write_text(
             _build_filter_script(
@@ -233,12 +297,25 @@ def process_video(
                 video_height=_as_int(metadata.get("video_height")),
                 crop_settings=crop_settings,
                 motion_settings=motion_settings,
+                background_music_settings=background_music_settings,
+                audio_boost_settings=audio_boost_settings,
+                kept_duration=kept_duration,
+                caption_artifacts=artifacts,
             ),
             encoding="utf-8",
         )
-        _log(log_callback, "Rendering the final speech-only MP4.")
-        _run_ffmpeg_with_progress(
-            [
+        use_nvenc = _nvenc_is_available()
+        if use_nvenc:
+            _log(
+                log_callback,
+                "Rendering cuts, effects, audio, and captions in one optimized pass using NVIDIA NVENC.",
+            )
+        else:
+            _log(
+                log_callback,
+                "NVIDIA NVENC is unavailable; rendering with the high-quality CPU encoder.",
+            )
+        render_command = [
                 "ffmpeg",
                 "-y",
                 "-hide_banner",
@@ -246,19 +323,26 @@ def process_video(
                 "error",
                 "-nostdin",
                 "-i",
-                str(input_path),
+                str(input_path.resolve()),
+        ]
+        if background_music_settings is not None:
+            render_command.extend(
+                [
+                    "-stream_loop",
+                    "-1",
+                    "-i",
+                    str(background_music_settings.path.resolve()),
+                ]
+            )
+        render_command.extend(
+            [
                 "-filter_complex_script",
                 str(filter_script_path),
                 "-map",
                 "[outv]",
                 "-map",
                 "[outa]",
-                "-c:v",
-                "libx264",
-                "-preset",
-                options.video_preset,
-                "-crf",
-                str(options.video_crf),
+                *_video_encoder_args(options, use_nvenc=use_nvenc),
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -268,48 +352,45 @@ def process_video(
                 "-progress",
                 "pipe:1",
                 "-nostats",
-                str(base_render_path),
+                str(output_path.resolve()),
             ],
-            total_duration=max(kept_duration, 0.001),
-            progress_start=0.60,
-            progress_end=1.00 if not needs_transcription(options.captions) else 0.82,
-            status="Rendering output video...",
-            progress_callback=progress_callback,
-            cancel_callback=cancel_callback,
         )
-
-        caption_event_count = 0
-        censored_word_count = 0
-        if needs_transcription(options.captions):
-            _ensure_not_cancelled(cancel_callback)
-            artifacts = _create_caption_artifacts(
-                base_render_path,
-                temp_dir_path,
-                options=options,
-                metadata=metadata,
-                kept_duration=kept_duration,
+        try:
+            _run_ffmpeg_with_progress(
+                render_command,
+                total_duration=max(kept_duration, 0.001),
+                progress_start=0.65 if transcription_needed else detection_end,
+                progress_end=1.00,
+                status="Rendering output video on the GPU..." if use_nvenc else "Rendering output video...",
                 progress_callback=progress_callback,
-                log_callback=log_callback,
                 cancel_callback=cancel_callback,
+                cwd=temp_dir_path,
             )
-            caption_event_count = artifacts.caption_event_count
-            censored_word_count = artifacts.censored_word_count
+        except ProcessingError:
+            if not use_nvenc or (cancel_callback and cancel_callback()):
+                raise
+            _mark_nvenc_unavailable()
+            _log(
+                log_callback,
+                "Warning: NVIDIA NVENC could not finish this render; retrying automatically on the CPU.",
+            )
+            cpu_render_command = _replace_video_encoder_args(
+                render_command,
+                _video_encoder_args(options, use_nvenc=False),
+            )
+            _run_ffmpeg_with_progress(
+                cpu_render_command,
+                total_duration=max(kept_duration, 0.001),
+                progress_start=0.65 if transcription_needed else detection_end,
+                progress_end=1.00,
+                status="Rendering output video on the CPU...",
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+                cwd=temp_dir_path,
+            )
 
-            if artifacts.subtitle_path or artifacts.profanity_intervals:
-                _log(log_callback, "Baking in TikTok-style subtitles and applying profanity filtering.")
-                _render_postprocessed_video(
-                    base_render_path,
-                    output_path,
-                    options=options,
-                    artifacts=artifacts,
-                    temp_dir_path=temp_dir_path,
-                    kept_duration=kept_duration,
-                    progress_callback=progress_callback,
-                    cancel_callback=cancel_callback,
-                )
-            else:
-                shutil.copyfile(base_render_path, output_path)
-                _emit_progress(progress_callback, 1.0, "Finished.")
+        caption_event_count = artifacts.caption_event_count
+        censored_word_count = artifacts.censored_word_count
 
     _emit_progress(progress_callback, 1.0, "Finished.")
     _log(log_callback, f"Saved output to {output_path}")
@@ -349,16 +430,23 @@ def probe_video_metadata(input_path: Path) -> dict[str, float | bool | None]:
 
     video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
 
+    average_fps = _parse_rate(video_stream.get("avg_frame_rate") if video_stream else None)
+    nominal_fps = _parse_rate(video_stream.get("r_frame_rate") if video_stream else None)
+    is_vfr = bool(
+        average_fps
+        and nominal_fps
+        and abs(average_fps - nominal_fps) / max(average_fps, nominal_fps) > 0.001
+    )
+
     return {
         "duration": duration,
         "has_video": any(stream.get("codec_type") == "video" for stream in streams),
         "has_audio": any(stream.get("codec_type") == "audio" for stream in streams),
         "video_width": _as_int(video_stream.get("width")) if video_stream else 0,
         "video_height": _as_int(video_stream.get("height")) if video_stream else 0,
-        "video_fps": _parse_rate(
-            video_stream.get("avg_frame_rate") if video_stream else None,
-            video_stream.get("r_frame_rate") if video_stream else None,
-        ),
+        "video_fps": average_fps or nominal_fps,
+        "video_nominal_fps": nominal_fps,
+        "is_vfr": is_vfr,
     }
 
 
@@ -433,6 +521,10 @@ def _build_filter_script(
     video_height: int,
     crop_settings: CropSettings | None,
     motion_settings: MotionSettings | None,
+    background_music_settings: BackgroundMusicSettings | None,
+    audio_boost_settings: AudioBoostSettings | None,
+    kept_duration: float,
+    caption_artifacts: CaptionArtifactResult | None = None,
 ) -> str:
     lines: list[str] = []
     clip_specs = _expand_segment_clips(
@@ -471,7 +563,42 @@ def _build_filter_script(
         lines.append(f"[0:a:0]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{index}]")
 
     concat_inputs = "".join(f"[v{index}][a{index}]" for index in range(len(clip_specs)))
-    lines.append(f"{concat_inputs}concat=n={len(clip_specs)}:v=1:a=1[outv][outa]")
+    lines.append(f"{concat_inputs}concat=n={len(clip_specs)}:v=1:a=1[video_concat][speech_concat]")
+
+    if caption_artifacts is not None and caption_artifacts.subtitle_path is not None:
+        lines.append(f"[video_concat]ass={caption_artifacts.subtitle_path.name}[outv]")
+    else:
+        lines.append("[video_concat]null[outv]")
+
+    if background_music_settings is None:
+        lines.append("[speech_concat]anull[audio_mix]")
+    else:
+        lines.append(
+            (
+                f"[1:a:0]atrim=duration={kept_duration:.6f},asetpts=PTS-STARTPTS,"
+                f"volume={background_music_settings.volume:.6f}[bga]"
+            )
+        )
+        lines.append("[speech_concat][bga]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[audio_mix]")
+
+    if audio_boost_settings is not None:
+        # A limiter after the gain bump keeps already-loud audio from clipping/distorting.
+        lines.append(
+            f"[audio_mix]volume={audio_boost_settings.gain_db:.3f}dB,"
+            "alimiter=limit=0.97:attack=5:release=50[audio_processed]"
+        )
+    else:
+        lines.append("[audio_mix]anull[audio_processed]")
+
+    if caption_artifacts is not None and caption_artifacts.profanity_intervals:
+        lines.append(
+            _build_audio_profanity_filter(
+                caption_artifacts.profanity_intervals,
+                input_label="audio_processed",
+            )
+        )
+    else:
+        lines.append("[audio_processed]anull[outa]")
     return ";\n".join(lines) + "\n"
 
 
@@ -595,12 +722,15 @@ def _build_push_in_filters(
 
 
 def _create_caption_artifacts(
-    base_render_path: Path,
+    transcription_audio_path: Path,
     temp_dir_path: Path,
     *,
     options: ProcessingOptions,
     metadata: dict[str, float | bool | None],
+    segments: list[SpeechSegment],
     kept_duration: float,
+    progress_start: float,
+    progress_end: float,
     progress_callback: ProgressCallback | None,
     log_callback: LogCallback | None,
     cancel_callback: CancelCallback | None,
@@ -612,15 +742,18 @@ def _create_caption_artifacts(
 
     try:
         artifacts = create_caption_artifacts(
-            base_render_path,
+            transcription_audio_path,
             temp_dir_path,
             video_width=video_width,
             video_height=video_height,
             total_duration=kept_duration,
             settings=options.captions,
+            source_duration=float(metadata.get("duration") or kept_duration),
+            timeline_segments=[(segment.start, segment.end) for segment in segments],
+            input_is_prepared_audio=True,
             progress_callback=lambda ratio, status: _emit_progress(
                 progress_callback,
-                0.82 + max(0.0, min(ratio, 1.0)) * 0.12,
+                progress_start + max(0.0, min(ratio, 1.0)) * (progress_end - progress_start),
                 status,
             ),
             log_callback=log_callback,
@@ -724,11 +857,126 @@ def _render_postprocessed_video(
     )
 
 
-def _build_audio_profanity_filter(intervals: list[tuple[float, float]]) -> str:
+def _build_audio_profanity_filter(
+    intervals: list[tuple[float, float]],
+    *,
+    input_label: str = "0:a:0",
+) -> str:
     filters = ["asetpts=PTS-STARTPTS"]
     for start, end in intervals:
         filters.append(f"volume=enable='between(t,{start:.3f},{end:.3f})':volume=0")
-    return f"[0:a:0]{','.join(filters)}[outa]"
+    return f"[{input_label}]{','.join(filters)}[outa]"
+
+
+def _video_encoder_args(options: ProcessingOptions, *, use_nvenc: bool) -> list[str]:
+    if not use_nvenc:
+        return [
+            "-c:v",
+            "libx264",
+            "-preset",
+            options.video_preset,
+            "-crf",
+            str(options.video_crf),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
+    if options.video_crf <= 0:
+        return [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p7",
+            "-tune",
+            "lossless",
+            "-rc",
+            "constqp",
+            "-qp",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
+    nvenc_quality = max(1, min(51, options.video_crf - 2))
+    return [
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p6",
+        "-tune",
+        "hq",
+        "-rc",
+        "vbr",
+        "-cq",
+        str(nvenc_quality),
+        "-b:v",
+        "0",
+        "-multipass",
+        "fullres",
+        "-spatial-aq",
+        "1",
+        "-temporal-aq",
+        "1",
+        "-aq-strength",
+        "8",
+        "-rc-lookahead",
+        "32",
+        "-bf",
+        "3",
+        "-b_ref_mode",
+        "middle",
+        "-profile:v",
+        "high",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+
+def _replace_video_encoder_args(command: list[str], encoder_args: list[str]) -> list[str]:
+    try:
+        video_start = command.index("-c:v")
+        audio_start = command.index("-c:a", video_start + 1)
+    except ValueError as exc:
+        raise ProcessingError("The FFmpeg render command is missing its video encoder settings.") from exc
+    return command[:video_start] + encoder_args + command[audio_start:]
+
+
+def _nvenc_is_available() -> bool:
+    global _NVENC_AVAILABLE_CACHE
+    if _NVENC_AVAILABLE_CACHE is not None:
+        return _NVENC_AVAILABLE_CACHE
+    try:
+        completed = _run_command(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=0.05",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p6",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+        )
+        _NVENC_AVAILABLE_CACHE = completed.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        _NVENC_AVAILABLE_CACHE = False
+    return _NVENC_AVAILABLE_CACHE
+
+
+def _mark_nvenc_unavailable() -> None:
+    global _NVENC_AVAILABLE_CACHE
+    _NVENC_AVAILABLE_CACHE = False
 
 
 def _run_ffmpeg_with_progress(
@@ -968,6 +1216,33 @@ def _prepare_motion_settings(motion: MotionSettings) -> MotionSettings | None:
     if motion.push_in_max_zoom > 1.5:
         raise ProcessingError("Push-in zoom must be 1.5x or lower.")
     return motion
+
+
+def _prepare_background_music_settings(background_music: BackgroundMusicSettings) -> BackgroundMusicSettings | None:
+    if not background_music.enabled:
+        return None
+    path = Path(background_music.path)
+    if not path.exists():
+        raise ProcessingError(f"Background music file is missing: {path}")
+    if background_music.volume < 0:
+        raise ProcessingError("Background music volume cannot be negative.")
+    if background_music.volume > 2.0:
+        raise ProcessingError("Background music volume must be 200% or lower.")
+    return BackgroundMusicSettings(
+        enabled=True,
+        path=path,
+        volume=float(background_music.volume),
+    )
+
+
+def _prepare_audio_boost_settings(audio_boost: AudioBoostSettings) -> AudioBoostSettings | None:
+    if not audio_boost.enabled:
+        return None
+    if audio_boost.gain_db < 0:
+        raise ProcessingError("Audio boost cannot be negative.")
+    if audio_boost.gain_db > 24.0:
+        raise ProcessingError("Audio boost must be 24 dB or lower.")
+    return AudioBoostSettings(enabled=True, gain_db=float(audio_boost.gain_db))
 
 
 def _should_crop_segment(

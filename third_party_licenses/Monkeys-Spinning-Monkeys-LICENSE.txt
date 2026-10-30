@@ -1,0 +1,10 @@
+Monkeys Spinning Monkeys
+
+Author: Kevin MacLeod
+Source: https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1400011
+
+Licensed under Creative Commons: By Attribution 4.0 License.
+License: https://creativecommons.org/licenses/by/4.0/
+
+Bundled file:
+speech_cutter/assets/monkeys_spinning_monkeys.mp3
