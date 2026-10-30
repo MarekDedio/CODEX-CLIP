@@ -26,3 +26,12 @@ This project bundles the `face_detection_yunet_2023mar.onnx` model from the Open
 - License: MIT
 
 The full license text is included in [third_party_licenses/YuNet-LICENSE.txt](third_party_licenses/YuNet-LICENSE.txt).
+
+## Anime face detection model
+
+This project bundles the `anime_face_detection_yolov8n.onnx` model from the DeepGHS anime face detection project to detect anime-style and VTuber faces alongside real faces.
+
+- Project: [deepghs/anime_face_detection](https://huggingface.co/deepghs/anime_face_detection)
+- License: MIT
+
+The full license text is included in [third_party_licenses/Anime-Face-Detection-LICENSE.txt](third_party_licenses/Anime-Face-Detection-LICENSE.txt).

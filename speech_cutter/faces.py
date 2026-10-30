@@ -1,8 +1,9 @@
 """Face detection and face-targeted zoom helpers.
 
-The detector uses the bundled YuNet ONNX model through OpenCV. Detections are
-sampled across the source video and linked into tracks, so each track represents
-one distinct face appearance that the user can select in the GUI.
+The detector combines the bundled YuNet ONNX model for real faces with a
+YOLOv8 anime-face model, so stylized and VTuber faces are counted as well.
+Detections are sampled across the source video and linked into tracks, so each
+track represents one distinct face appearance the user can select in the GUI.
 """
 
 from __future__ import annotations
@@ -13,10 +14,13 @@ from typing import Callable, Iterable, Sequence
 import math
 
 FACE_MODEL_PATH = Path(__file__).resolve().parent / "assets" / "face_detection_yunet_2023mar.onnx"
+ANIME_FACE_MODEL_PATH = Path(__file__).resolve().parent / "assets" / "anime_face_detection_yolov8n.onnx"
 MANUAL_ZOOM_LABEL = "Kadr ręczny"
 FACE_ZOOM_LABEL = "Twarze"
 FACE_COUNT_OPTIONS = ("Auto", "1", "2", "3", "4", "5", "6")
 MIN_FACE_SCORE = 0.65
+ANIME_FACE_SCORE = 0.30
+ANIME_FACE_INPUT_SIZE = 480
 MAX_FACE_SAMPLES = 480
 DEFAULT_FACE_PADDING = 0.35
 DEFAULT_FACE_MAX_ZOOM = 1.8
@@ -126,13 +130,17 @@ def detect_faces(
     try:
         import cv2
         import numpy as np
+        import onnxruntime as ort
     except ImportError as exc:  # pragma: no cover - depends on the local environment
         raise FaceDetectionError(
-            "Face detection needs OpenCV. Run: .venv\\Scripts\\python -m pip install -r requirements.txt"
+            "Face detection needs OpenCV and ONNX Runtime. Run: "
+            ".venv\\Scripts\\python -m pip install -r requirements.txt"
         ) from exc
 
     if not FACE_MODEL_PATH.exists():
         raise FaceDetectionError(f"Face detection model is missing: {FACE_MODEL_PATH}")
+    if not ANIME_FACE_MODEL_PATH.exists():
+        raise FaceDetectionError(f"Anime face detection model is missing: {ANIME_FACE_MODEL_PATH}")
 
     video_path = Path(video_path)
     if not video_path.exists():
@@ -178,6 +186,7 @@ def detect_faces(
             0.3,
             5000,
         )
+        anime_detector = _create_anime_detector(ort)
 
         target_count = max(0, int(target_face_count or 0))
         minimum_hits = _minimum_track_hits(actual_interval)
@@ -225,6 +234,9 @@ def detect_faces(
                 frame,
                 min_score=min_score,
             )
+            anime_detections = _detect_anime_frame_faces(cv2, np, anime_detector, frame)
+            if anime_detections:
+                detections = _merge_face_detections(detections, anime_detections)
             _track_detections(
                 cv2,
                 np,
@@ -411,6 +423,121 @@ def compute_face_crop(
     x = max(0, min(frame_width - width, x))
     y = max(0, min(frame_height - height, y))
     return x, y, width, height
+
+
+def _create_anime_detector(ort: object) -> object:
+    try:
+        return ort.InferenceSession(
+            str(ANIME_FACE_MODEL_PATH),
+            providers=["CPUExecutionProvider"],
+        )
+    except Exception as exc:  # pragma: no cover - depends on the ONNX runtime build
+        raise FaceDetectionError(f"Could not load the anime face detection model: {exc}") from exc
+
+
+def _detect_anime_frame_faces(
+    cv2: object,
+    np: object,
+    detector: object,
+    frame: object,
+    *,
+    min_score: float = ANIME_FACE_SCORE,
+) -> list[FaceBox]:
+    frame_height, frame_width = frame.shape[:2]
+    if frame_width <= 0 or frame_height <= 0:
+        return []
+
+    size = ANIME_FACE_INPUT_SIZE
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
+    tensor = (resized.transpose(2, 0, 1).astype(np.float32) / 255.0)[None, ...]
+    input_name = detector.get_inputs()[0].name
+    output = detector.run(None, {input_name: tensor})[0]
+    if output.ndim == 3:
+        output = output[0]
+    if output.shape[0] == 5 and output.shape[1] != 5:
+        output = output.transpose(1, 0)
+
+    scores = output[:, 4]
+    keep = scores >= min_score
+    if not bool(np.any(keep)):
+        return []
+
+    centers = output[keep, :4]
+    scores = scores[keep]
+    boxes = np.empty_like(centers)
+    boxes[:, 0] = centers[:, 0] - centers[:, 2] / 2.0
+    boxes[:, 1] = centers[:, 1] - centers[:, 3] / 2.0
+    boxes[:, 2] = centers[:, 0] + centers[:, 2] / 2.0
+    boxes[:, 3] = centers[:, 1] + centers[:, 3] / 2.0
+
+    indices = cv2.dnn.NMSBoxes(
+        boxes.tolist(),
+        scores.tolist(),
+        float(min_score),
+        0.7,
+    )
+    if len(indices) == 0:
+        return []
+
+    scale_x = frame_width / float(size)
+    scale_y = frame_height / float(size)
+    faces: list[FaceBox] = []
+    for index in np.asarray(indices).reshape(-1):
+        x0, y0, x1, y1 = boxes[int(index)]
+        left = max(0, min(frame_width - 1, int(round(float(x0) * scale_x))))
+        top = max(0, min(frame_height - 1, int(round(float(y0) * scale_y))))
+        right = max(left + 1, min(frame_width, int(round(float(x1) * scale_x))))
+        bottom = max(top + 1, min(frame_height, int(round(float(y1) * scale_y))))
+        width = right - left
+        height = bottom - top
+        if width < _MIN_FACE_SIDE_PX or height < _MIN_FACE_SIDE_PX:
+            continue
+        if width / max(height, 1) < 0.45 or width / max(height, 1) > 2.2:
+            continue
+        faces.append(
+            FaceBox(
+                time=0.0,
+                x=left,
+                y=top,
+                width=width,
+                height=height,
+                score=float(scores[int(index)]),
+            )
+        )
+
+    faces.sort(key=lambda box: box.area, reverse=True)
+    return faces
+
+
+def _merge_face_detections(
+    primary: Sequence[FaceBox],
+    secondary: Sequence[FaceBox],
+) -> list[FaceBox]:
+    """Combine real and anime detections without duplicating the same face."""
+
+    merged = list(primary)
+    for box in secondary:
+        if any(_is_same_face(box, existing) for existing in merged):
+            continue
+        merged.append(box)
+    return merged
+
+
+def _is_same_face(first: FaceBox, second: FaceBox) -> bool:
+    if _iou(first, second) >= 0.35:
+        return True
+    intersection = _face_intersection(first, second)
+    smaller = min(first.area, second.area)
+    return smaller > 0 and intersection / smaller >= 0.55
+
+
+def _face_intersection(first: FaceBox, second: FaceBox) -> int:
+    left = max(first.x, second.x)
+    top = max(first.y, second.y)
+    right = min(first.x + first.width, second.x + second.width)
+    bottom = min(first.y + first.height, second.y + second.height)
+    return max(0, right - left) * max(0, bottom - top)
 
 
 def _detect_frame_faces(cv2: object, detector: object, frame: object, *, min_score: float) -> tuple[list[FaceBox], float]:
