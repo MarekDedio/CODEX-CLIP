@@ -29,6 +29,7 @@ from .credentials import (
 from .faces import (
     DEFAULT_FACE_MAX_ZOOM,
     DEFAULT_FACE_PADDING,
+    FACE_COUNT_OPTIONS,
     FACE_ZOOM_LABEL,
     MANUAL_ZOOM_LABEL,
     DetectedFace,
@@ -187,6 +188,15 @@ def _read_saved_face_max_zoom() -> float:
         return DEFAULT_FACE_MAX_ZOOM
 
 
+def _read_saved_face_count() -> int:
+    settings = _load_app_settings()
+    value = settings.get("face_count")
+    try:
+        return min(6, max(0, int(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
 class PreviewLoadingDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, *, video_name: str) -> None:
         super().__init__(parent)
@@ -236,15 +246,29 @@ class PreviewLoadingDialog(tk.Toplevel):
             pass
 
 
+def _translate_face_scan_status(status: str) -> str:
+    if status == "Scanning the video for faces...":
+        return "Skanuję klatki w poszukiwaniu twarzy..."
+    if status == "Face scan finished.":
+        return "Skanowanie zakończone."
+    if status.startswith("Found ") and "stopping the scan early" in status:
+        return "Znaleziono oczekiwaną liczbę twarzy. Kończę skanowanie."
+    if status.startswith("Scan stopped;"):
+        return "Skanowanie zatrzymane. Zachowuję wykryte twarze."
+    return status
+
+
 class FaceScanDialog(ctk.CTkToplevel):
     def __init__(self, parent: tk.Misc, *, video_name: str) -> None:
         super().__init__(parent)
         self.title("Wykrywanie twarzy")
-        self.geometry("540x260")
+        self.geometry("540x320")
         self.resizable(False, False)
         self.transient(parent)
         self.configure(fg_color="#090D18")
         self.cancel_event = threading.Event()
+        self.stop_event = threading.Event()
+        self._status_locked = False
 
         frame = ctk.CTkFrame(
             self,
@@ -273,6 +297,15 @@ class FaceScanDialog(ctk.CTkToplevel):
             justify="left",
             wraplength=460,
         ).grid(row=1, column=0, sticky="ew", padx=22)
+        self._count_var = tk.StringVar(value="Wykryte twarze: 0")
+        ctk.CTkLabel(
+            frame,
+            textvariable=self._count_var,
+            text_color="#C4B5FD",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            anchor="w",
+            justify="left",
+        ).grid(row=2, column=0, sticky="ew", padx=22, pady=(16, 2))
         self._status_var = tk.StringVar(value="Przygotowuję skanowanie...")
         ctk.CTkLabel(
             frame,
@@ -282,7 +315,7 @@ class FaceScanDialog(ctk.CTkToplevel):
             anchor="w",
             justify="left",
             wraplength=460,
-        ).grid(row=2, column=0, sticky="ew", padx=22, pady=(16, 6))
+        ).grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 6))
         self._progress = ctk.CTkProgressBar(
             frame,
             height=8,
@@ -291,9 +324,25 @@ class FaceScanDialog(ctk.CTkToplevel):
             progress_color="#7C5CFC",
         )
         self._progress.set(0.0)
-        self._progress.grid(row=3, column=0, sticky="ew", padx=22)
+        self._progress.grid(row=4, column=0, sticky="ew", padx=22)
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons.grid(row=5, column=0, sticky="ew", padx=22, pady=(16, 20))
+        self._stop_button = ctk.CTkButton(
+            buttons,
+            text="Wystarczy",
+            command=self._request_stop,
+            width=110,
+            height=38,
+            corner_radius=10,
+            state="disabled",
+            fg_color="#173A2E",
+            hover_color="#1F4D3D",
+            text_color="#6EE7B7",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+        )
+        self._stop_button.pack(side="right", padx=(0, 10))
         self._cancel_button = ctk.CTkButton(
-            frame,
+            buttons,
             text="Anuluj",
             command=self._request_cancel,
             width=110,
@@ -304,7 +353,7 @@ class FaceScanDialog(ctk.CTkToplevel):
             text_color="#FB7185",
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
         )
-        self._cancel_button.grid(row=4, column=0, sticky="e", padx=22, pady=(16, 20))
+        self._cancel_button.pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self._request_cancel)
         self.update_idletasks()
@@ -312,11 +361,26 @@ class FaceScanDialog(ctk.CTkToplevel):
 
     def set_progress(self, value: float, status: str) -> None:
         self._progress.set(max(0.0, min(1.0, float(value))))
-        self._status_var.set(status)
+        if not self._status_locked:
+            self._status_var.set(_translate_face_scan_status(status))
+
+    def set_face_count(self, count: int) -> None:
+        count = max(0, int(count))
+        self._count_var.set(f"Wykryte twarze: {count}")
+        if count > 0 and not self.stop_event.is_set() and not self.cancel_event.is_set():
+            self._stop_button.configure(state="normal")
+
+    def _request_stop(self) -> None:
+        self.stop_event.set()
+        self._status_locked = True
+        self._stop_button.configure(state="disabled")
+        self._status_var.set("Kończę wyszukiwanie i zachowuję wykryte twarze...")
 
     def _request_cancel(self) -> None:
         self.cancel_event.set()
+        self._status_locked = True
         self._cancel_button.configure(state="disabled")
+        self._stop_button.configure(state="disabled")
         self._status_var.set("Anulowanie...")
 
     def _activate_dialog(self) -> None:
@@ -1281,6 +1345,7 @@ class SpeechCutterApp(ctk.CTk):
         self._manual_crop_widgets: list[tk.Widget] = []
         self._shared_crop_widgets: list[tk.Widget] = []
         self._face_setting_widgets: list[tk.Widget] = []
+        self._face_scan_widgets: list[tk.Widget] = []
         self._queue_refreshing = False
         self._queued_videos: list[QueuedVideo] = []
         self._selected_queue_index = 0
@@ -1359,6 +1424,10 @@ class SpeechCutterApp(ctk.CTk):
         self.face_padding_value_var = tk.StringVar()
         self.face_max_zoom_var = tk.DoubleVar(value=_read_saved_face_max_zoom())
         self.face_max_zoom_value_var = tk.StringVar()
+        saved_face_count = _read_saved_face_count()
+        self.face_count_var = tk.StringVar(
+            value="Auto" if saved_face_count <= 0 else str(saved_face_count)
+        )
 
         self.padding_seconds_var.trace_add("write", self._refresh_setting_labels)
         self.crop_every_var.trace_add("write", self._refresh_setting_labels)
@@ -1570,6 +1639,15 @@ class SpeechCutterApp(ctk.CTk):
             self.face_max_zoom_var.set(snapped)
         self._schedule_settings_save()
 
+    def _selected_face_count(self) -> int:
+        value = self.face_count_var.get().strip()
+        if not value.isdigit():
+            return 0
+        return min(10, max(0, int(value)))
+
+    def _on_face_count_changed(self, _value: str | None = None) -> None:
+        self._schedule_settings_save()
+
     def _schedule_settings_save(self) -> None:
         if self._settings_save_after_id is not None:
             self.after_cancel(self._settings_save_after_id)
@@ -1582,6 +1660,7 @@ class SpeechCutterApp(ctk.CTk):
         settings["audio_boost_gain_db"] = float(self.audio_boost_gain_db_var.get())
         settings["face_padding_percent"] = float(self.face_padding_percent_var.get())
         settings["face_max_zoom"] = float(self.face_max_zoom_var.get())
+        settings["face_count"] = self._selected_face_count()
         _save_app_settings(settings)
 
     def _on_scroll_frame_configure(self, _event: tk.Event[tk.Widget] | None = None) -> None:
@@ -2603,10 +2682,9 @@ class SpeechCutterApp(ctk.CTk):
             and selected_video.face_analysis
             and selected_video.face_analysis.faces
         )
-        if hasattr(self, "detect_faces_button"):
-            self.detect_faces_button.configure(
-                state="disabled" if self._processing_active else "normal"
-            )
+        scan_state = "disabled" if self._processing_active else "normal"
+        for widget in getattr(self, "_face_scan_widgets", ()):
+            widget.configure(state=scan_state)
         if hasattr(self, "choose_faces_button"):
             self.choose_faces_button.configure(
                 state="normal" if has_faces and not self._processing_active else "disabled"
@@ -2664,13 +2742,23 @@ class SpeechCutterApp(ctk.CTk):
                 self.status_var.set("Wykrywanie twarzy anulowane.")
                 return
             video.face_analysis = analysis
+            if analysis.stopped_by_user:
+                stopped_note = ", skan zatrzymany ręcznie"
+            elif analysis.stopped_early:
+                stopped_note = f", skan zatrzymany po {analysis.target_face_count} twarzach"
+            else:
+                stopped_note = ""
             if analysis.faces:
                 scanned_with_faces.append(video)
                 self._append_log(
-                    f"Wykryto {len(analysis.faces)} twarzy w {video.path.name}."
+                    f"Wykryto {len(analysis.faces)} twarzy w {video.path.name} "
+                    f"(próbki: {analysis.samples_scanned}{stopped_note})."
                 )
             else:
-                self._append_log(f"Nie znaleziono twarzy w {video.path.name}.")
+                self._append_log(
+                    f"Nie znaleziono twarzy w {video.path.name} "
+                    f"(próbki: {analysis.samples_scanned})."
+                )
                 if len(videos) == 1:
                     messagebox.showwarning(
                         "Nie znaleziono twarzy",
@@ -2745,16 +2833,20 @@ class SpeechCutterApp(ctk.CTk):
         dialog = FaceScanDialog(self, video_name=video.path.name)
         result_queue: Queue[tuple[str, object]] = Queue()
         result_holder: dict[str, object] = {}
+        target_face_count = self._selected_face_count()
 
         def worker() -> None:
             try:
                 analysis = detect_faces(
                     video.path,
                     duration=duration,
+                    target_face_count=target_face_count,
                     progress_callback=lambda value, status: result_queue.put(
                         ("progress", (value, status))
                     ),
+                    count_callback=lambda count: result_queue.put(("count", count)),
                     cancel_callback=dialog.cancel_event.is_set,
+                    stop_callback=dialog.stop_event.is_set,
                 )
             except FaceDetectionCancelledError:
                 result_queue.put(("cancelled", None))
@@ -2773,6 +2865,8 @@ class SpeechCutterApp(ctk.CTk):
                     if kind == "progress":
                         value, status = payload  # type: ignore[misc]
                         dialog.set_progress(float(value), str(status))
+                    elif kind == "count":
+                        dialog.set_face_count(int(payload))  # type: ignore[arg-type]
                     elif kind == "ok":
                         result_holder["analysis"] = payload
                     elif kind == "error":
@@ -2943,6 +3037,7 @@ class SpeechCutterApp(ctk.CTk):
             audio_boost_gain_db = min(24.0, max(0.0, float(self.audio_boost_gain_db_var.get())))
             face_padding = min(1.5, max(0.0, float(self.face_padding_percent_var.get()) / 100.0))
             face_max_zoom = min(4.0, max(1.01, float(self.face_max_zoom_var.get())))
+            face_count = self._selected_face_count()
         except (tk.TclError, ValueError):
             messagebox.showerror("Invalid settings", "One of the trim, crop, motion, or music settings is not valid.")
             return None
@@ -3085,6 +3180,7 @@ class SpeechCutterApp(ctk.CTk):
                 selected_face_ids=tuple(video.selected_face_ids) if video.face_analysis else (),
                 padding=face_padding,
                 max_zoom=face_max_zoom,
+                expected_face_count=face_count,
             )
             if face_mode and video.face_analysis is None:
                 self._append_log(

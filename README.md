@@ -82,13 +82,22 @@ To follow specific detected faces, run once with `--face-zoom` to see the detect
 .\.venv\Scripts\python app.py input.mp4 --face-zoom --face-id 2 --face-padding 0.4 --face-max-zoom 1.8
 ```
 
+When the number of people is known, stop scanning as soon as they are found:
+
+```powershell
+.\.venv\Scripts\python app.py input.mp4 --face-zoom --face-count 2
+```
+
+`--face-count 0` (the default) scans every sample.
+
 ## Face-targeted zooms
 
 1. Load a video and enable "Włącz dynamiczny kadr".
 2. Set "Cel przybliżeń" to "Twarze".
-3. Click "Wykryj twarze". The scan samples frames, groups detections into distinct face tracks, and shows a thumbnail per face.
-4. Pick one or more faces in the dialog, or leave everything unchecked to automatically follow the largest visible face in each segment.
-5. Adjust "Oddech wokół twarzy" and "Limit przybliżenia twarzy", then export.
+3. Optionally choose the expected number of people under "Liczba osób". "Auto" scans every sample; picking a number stops the scan once that many faces are confirmed.
+4. Click "Wykryj twarze". The scan samples at most 480 frames spread across the video, groups detections into distinct face tracks, and shows a thumbnail per face. The dialog shows "Wykryte twarze: N" while it works; click "Wystarczy" to stop searching early and keep the faces found so far.
+5. Pick one or more faces in the dialog, or leave everything unchecked to automatically follow the largest visible face in each segment.
+6. Adjust "Oddech wokół twarzy" and "Limit przybliżenia twarzy", then export.
 
 Face mode reuses the existing zoom cadence controls ("Co który segment mowy", "Pomiń segmenty krótsze niż", "Czas przybliżenia"). In queue mode you can scan every video at once; videos without a scan are analyzed automatically during export. If no face is found in a segment, the manual crop is used when one exists; otherwise that segment is rendered without a zoom. Switching back to "Kadr ręczny" restores the manual crop picker.
 

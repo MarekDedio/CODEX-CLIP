@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import patch
+import importlib.util
+import tempfile
 import unittest
 
 from speech_cutter.faces import (
@@ -7,6 +11,7 @@ from speech_cutter.faces import (
     FaceBox,
     choose_face_for_range,
     compute_face_crop,
+    detect_faces,
     face_box_for_range,
 )
 from speech_cutter.pipeline import (
@@ -34,6 +39,190 @@ def make_face(face_id: int, x: int, y: int, width: int, height: int, *, start: f
         first_seen=start,
         last_seen=end,
     )
+
+
+class _FakeCapture:
+    def __init__(self, frame: object) -> None:
+        self.frame = frame
+        self.read_calls = 0
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, prop: int) -> float:
+        import cv2
+
+        return {
+            cv2.CAP_PROP_FRAME_WIDTH: float(self.frame.shape[1]),
+            cv2.CAP_PROP_FRAME_HEIGHT: float(self.frame.shape[0]),
+            cv2.CAP_PROP_FPS: 10.0,
+            cv2.CAP_PROP_FRAME_COUNT: 100.0,
+        }.get(prop, 0.0)
+
+    def set(self, prop: int, value: float) -> bool:
+        return True
+
+    def read(self) -> tuple[bool, object]:
+        self.read_calls += 1
+        return True, self.frame
+
+    def release(self) -> None:
+        pass
+
+
+class _FakeFaceDetector:
+    def __init__(self, detections: object) -> None:
+        self.detections = detections
+
+    def setInputSize(self, size: tuple[int, int]) -> None:
+        pass
+
+    def detect(self, frame: object) -> tuple[int, object]:
+        return 1, self.detections
+
+
+class _FakeFaceDetectorFactory:
+    def __init__(self, detections: object) -> None:
+        self.detections = detections
+
+    def create(self, *args: object, **kwargs: object) -> _FakeFaceDetector:
+        return _FakeFaceDetector(self.detections)
+
+
+_CV2_AVAILABLE = importlib.util.find_spec("cv2") is not None
+
+
+class FaceScanTests(unittest.TestCase):
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_scan_stops_after_requested_face_count(self) -> None:
+        import cv2
+        import numpy as np
+
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        detections = np.array(
+            [[100, 50, 80, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.95]],
+            dtype=np.float32,
+        )
+        capture = _FakeCapture(frame)
+        factory = _FakeFaceDetectorFactory(detections)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as handle:
+            video_path = Path(handle.name)
+            with (
+                patch.object(cv2, "VideoCapture", lambda *_args, **_kwargs: capture),
+                patch.object(cv2, "FaceDetectorYN", factory),
+            ):
+                analysis = detect_faces(
+                    video_path,
+                    duration=10.0,
+                    sample_interval=0.5,
+                    target_face_count=1,
+                )
+
+        self.assertTrue(analysis.stopped_early)
+        self.assertEqual(analysis.target_face_count, 1)
+        self.assertEqual(analysis.samples_scanned, 2)
+        self.assertEqual(capture.read_calls, 2)
+        self.assertEqual(len(analysis.faces), 1)
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_scan_without_target_reads_all_samples(self) -> None:
+        import cv2
+        import numpy as np
+
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        detections = np.array(
+            [[100, 50, 80, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.95]],
+            dtype=np.float32,
+        )
+        capture = _FakeCapture(frame)
+        factory = _FakeFaceDetectorFactory(detections)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as handle:
+            video_path = Path(handle.name)
+            with (
+                patch.object(cv2, "VideoCapture", lambda *_args, **_kwargs: capture),
+                patch.object(cv2, "FaceDetectorYN", factory),
+            ):
+                analysis = detect_faces(
+                    video_path,
+                    duration=10.0,
+                    sample_interval=0.5,
+                )
+
+        self.assertFalse(analysis.stopped_early)
+        self.assertEqual(analysis.samples_scanned, 20)
+        self.assertEqual(capture.read_calls, 20)
+        self.assertEqual(len(analysis.faces), 1)
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_scan_reports_live_face_count(self) -> None:
+        import cv2
+        import numpy as np
+
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        detections = np.array(
+            [[100, 50, 80, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.95]],
+            dtype=np.float32,
+        )
+        capture = _FakeCapture(frame)
+        factory = _FakeFaceDetectorFactory(detections)
+        counts: list[int] = []
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as handle:
+            video_path = Path(handle.name)
+            with (
+                patch.object(cv2, "VideoCapture", lambda *_args, **_kwargs: capture),
+                patch.object(cv2, "FaceDetectorYN", factory),
+            ):
+                detect_faces(
+                    video_path,
+                    duration=10.0,
+                    sample_interval=0.5,
+                    count_callback=counts.append,
+                )
+
+        self.assertEqual(counts, [1])
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_user_stop_keeps_already_detected_faces(self) -> None:
+        import cv2
+        import numpy as np
+
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        detections = np.array(
+            [[100, 50, 80, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.95]],
+            dtype=np.float32,
+        )
+        capture = _FakeCapture(frame)
+        factory = _FakeFaceDetectorFactory(detections)
+        state = {"stop": False}
+        counts: list[int] = []
+
+        def on_count(count: int) -> None:
+            counts.append(count)
+            state["stop"] = True
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as handle:
+            video_path = Path(handle.name)
+            with (
+                patch.object(cv2, "VideoCapture", lambda *_args, **_kwargs: capture),
+                patch.object(cv2, "FaceDetectorYN", factory),
+            ):
+                analysis = detect_faces(
+                    video_path,
+                    duration=10.0,
+                    sample_interval=0.5,
+                    count_callback=on_count,
+                    stop_callback=lambda: state["stop"],
+                )
+
+        self.assertTrue(analysis.stopped_early)
+        self.assertTrue(analysis.stopped_by_user)
+        self.assertEqual(analysis.samples_scanned, 2)
+        self.assertEqual(capture.read_calls, 2)
+        self.assertEqual(counts, [1])
+        self.assertEqual(len(analysis.faces), 1)
 
 
 class FaceCropTests(unittest.TestCase):

@@ -104,6 +104,7 @@ class FaceZoomSettings:
     selected_face_ids: tuple[int, ...] = ()
     padding: float = DEFAULT_FACE_PADDING
     max_zoom: float = DEFAULT_FACE_MAX_ZOOM
+    expected_face_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1420,6 +1421,9 @@ def _prepare_face_zoom_settings(
         raise ProcessingError("Face padding must be between 0 and 150 percent.")
     if not 1.01 <= faces.max_zoom <= 4.0:
         raise ProcessingError("Face zoom must be between 1.01x and 4.0x.")
+    expected_face_count = max(0, int(faces.expected_face_count))
+    if expected_face_count > 10:
+        raise ProcessingError("Face count must be between 0 and 10 (0 scans every sample).")
 
     detected_faces = tuple(faces.faces)
     if not detected_faces:
@@ -1429,6 +1433,7 @@ def _prepare_face_zoom_settings(
             analysis: FaceAnalysis = detect_faces(
                 input_path,
                 duration=duration,
+                target_face_count=expected_face_count,
                 progress_callback=lambda ratio, status: _emit_progress(
                     progress_callback,
                     progress_start + max(0.0, min(ratio, 1.0)) * (progress_end - progress_start),
@@ -1442,6 +1447,11 @@ def _prepare_face_zoom_settings(
             raise ProcessingError(str(exc)) from exc
         detected_faces = analysis.faces
         _log(log_callback, f"Detected {len(detected_faces)} distinct face track(s).")
+        if analysis.stopped_early:
+            _log(
+                log_callback,
+                f"Stopped the face scan after finding {analysis.target_face_count} track(s).",
+            )
 
     if detected_faces:
         face_summary = ", ".join(
@@ -1473,6 +1483,7 @@ def _prepare_face_zoom_settings(
         selected_face_ids=selected_ids,
         padding=float(faces.padding),
         max_zoom=float(faces.max_zoom),
+        expected_face_count=expected_face_count,
     )
 
 

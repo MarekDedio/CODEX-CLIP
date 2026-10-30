@@ -5,7 +5,7 @@ import tkinter as tk
 
 import customtkinter as ctk
 
-from .faces import FACE_ZOOM_LABEL, MANUAL_ZOOM_LABEL
+from .faces import FACE_COUNT_OPTIONS, FACE_ZOOM_LABEL, MANUAL_ZOOM_LABEL
 
 
 BG = "#090D18"
@@ -461,6 +461,25 @@ def build_main_layout(app: tk.Misc) -> None:
     app.detect_faces_button.grid(row=0, column=0)
     app.choose_faces_button = _button(face_actions, "Wybierz twarze", app._choose_faces_clicked, width=140, state="disabled")
     app.choose_faces_button.grid(row=0, column=1, padx=(8, 0))
+    _label(face_actions, "Liczba osób").grid(row=0, column=2, sticky="e", padx=(18, 8))
+    app.face_count_menu = ctk.CTkOptionMenu(
+        face_actions,
+        variable=app.face_count_var,
+        values=FACE_COUNT_OPTIONS,
+        command=app._on_face_count_changed,
+        width=82,
+        height=36,
+        corner_radius=9,
+        fg_color=INPUT,
+        button_color=BORDER,
+        button_hover_color=ACCENT,
+        dropdown_fg_color=SURFACE,
+        dropdown_hover_color=ACCENT_SOFT,
+        text_color=TEXT,
+        font=_font(12),
+        dropdown_font=_font(12),
+    )
+    app.face_count_menu.grid(row=0, column=3)
 
     _label(crop_body, textvariable=app.crop_summary_var, wraplength=560).grid(
         row=4, column=0, sticky="w", pady=(12, 0)
@@ -525,6 +544,7 @@ def build_main_layout(app: tk.Misc) -> None:
     ]
     app._crop_widgets = [*app._manual_crop_widgets, *app._shared_crop_widgets]
     app._face_setting_widgets = [app.face_padding_scale, app.face_max_zoom_scale]
+    app._face_scan_widgets = [app.detect_faces_button, app.face_count_menu]
 
     # Audio page.
     audio_page = pages["Dźwięk"]

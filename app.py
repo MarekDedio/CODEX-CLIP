@@ -155,6 +155,13 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_FACE_MAX_ZOOM,
         help="Maximum face zoom, such as 1.8 for 80 percent.",
     )
+    parser.add_argument(
+        "--face-count",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Stop scanning once N distinct faces are found (0 = scan all samples).",
+    )
     args = parser.parse_args(argv)
 
     if args.face_id and not args.face_zoom:
@@ -212,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
                 selected_face_ids=tuple(args.face_id),
                 padding=max(0.0, float(args.face_padding)),
                 max_zoom=max(1.01, float(args.face_max_zoom)),
+                expected_face_count=max(0, int(args.face_count)),
             ),
             captions=CaptionSettings(
                 enabled=bool(args.captions),

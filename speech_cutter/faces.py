@@ -15,6 +15,7 @@ import math
 FACE_MODEL_PATH = Path(__file__).resolve().parent / "assets" / "face_detection_yunet_2023mar.onnx"
 MANUAL_ZOOM_LABEL = "Kadr ręczny"
 FACE_ZOOM_LABEL = "Twarze"
+FACE_COUNT_OPTIONS = ("Auto", "1", "2", "3", "4", "5", "6")
 MIN_FACE_SCORE = 0.65
 MAX_FACE_SAMPLES = 480
 DEFAULT_FACE_PADDING = 0.35
@@ -24,6 +25,8 @@ _THUMBNAIL_SIDE_PX = 160
 
 FaceProgressCallback = Callable[[float, str], None]
 FaceCancelCallback = Callable[[], bool]
+FaceStopCallback = Callable[[], bool]
+FaceCountCallback = Callable[[int], None]
 
 
 class FaceDetectionError(RuntimeError):
@@ -79,6 +82,10 @@ class FaceAnalysis:
     duration: float
     sample_interval: float
     faces: tuple[DetectedFace, ...]
+    target_face_count: int = 0
+    stopped_early: bool = False
+    stopped_by_user: bool = False
+    samples_scanned: int = 0
 
     @property
     def has_faces(self) -> bool:
@@ -100,14 +107,20 @@ def detect_faces(
     duration: float | None = None,
     sample_interval: float | None = None,
     max_samples: int = MAX_FACE_SAMPLES,
+    target_face_count: int = 0,
     min_score: float = MIN_FACE_SCORE,
     progress_callback: FaceProgressCallback | None = None,
+    count_callback: FaceCountCallback | None = None,
     cancel_callback: FaceCancelCallback | None = None,
+    stop_callback: FaceStopCallback | None = None,
 ) -> FaceAnalysis:
     """Scan a video and return distinct face tracks.
 
     Sampling is spread evenly across the video (at most ``max_samples`` frames),
-    which keeps analysis fast even for long recordings.
+    so the detector never analyzes every frame. When ``target_face_count`` is
+    greater than zero, scanning stops once that many tracks are confirmed.
+    ``stop_callback`` can request an early finish that keeps the faces found so
+    far, while ``cancel_callback`` aborts the scan without results.
     """
 
     try:
@@ -166,13 +179,41 @@ def detect_faces(
             5000,
         )
 
+        target_count = max(0, int(target_face_count or 0))
+        minimum_hits = _minimum_track_hits(actual_interval)
+        min_samples_before_stop = min(
+            sample_count,
+            max(2, int(math.ceil(1.0 / max(actual_interval, 0.001)))),
+        )
         tracks: list[_FaceTrack] = []
+        samples_scanned = 0
+        stopped_early = False
+        stopped_by_user = False
+        confirmed_count = 0
+
+        def update_confirmed_count() -> int:
+            nonlocal confirmed_count
+            total = sum(
+                1 for track in tracks if len(track.boxes) >= minimum_hits
+            )
+            if target_count > 0:
+                total = min(total, target_count)
+            if total != confirmed_count:
+                confirmed_count = total
+                _emit_count(count_callback, confirmed_count)
+            return confirmed_count
+
         _emit(progress_callback, 0.0, "Scanning the video for faces...")
 
         for sample_index, sample_time in enumerate(sample_times):
             if cancel_callback is not None and cancel_callback():
                 raise FaceDetectionCancelledError("Face detection was cancelled.")
+            if stop_callback is not None and stop_callback():
+                stopped_early = True
+                stopped_by_user = True
+                break
 
+            samples_scanned = sample_index + 1
             capture.set(cv2.CAP_PROP_POS_MSEC, sample_time * 1000.0)
             read_ok, frame = capture.read()
             if not read_ok or frame is None:
@@ -193,6 +234,16 @@ def detect_faces(
                 tracks,
                 max_gap=max(1.5, actual_interval * 3.0),
             )
+
+            confirmed = update_confirmed_count()
+            if (
+                target_count > 0
+                and samples_scanned >= min_samples_before_stop
+                and confirmed >= target_count
+            ):
+                stopped_early = True
+                break
+
             _emit(
                 progress_callback,
                 min(0.99, (sample_index + 1) / sample_count),
@@ -200,13 +251,34 @@ def detect_faces(
             )
 
         faces = _finalize_tracks(tracks, actual_interval)
-        _emit(progress_callback, 1.0, "Face scan finished.")
+        if target_count > 0:
+            faces = faces[:target_count]
+        if len(faces) != confirmed_count:
+            _emit_count(count_callback, len(faces))
+        if stopped_by_user:
+            _emit(
+                progress_callback,
+                1.0,
+                f"Scan stopped; keeping {len(faces)} face track(s).",
+            )
+        elif stopped_early:
+            _emit(
+                progress_callback,
+                1.0,
+                f"Found {target_count} face track(s); stopping the scan early.",
+            )
+        else:
+            _emit(progress_callback, 1.0, "Face scan finished.")
         return FaceAnalysis(
             video_width=video_width,
             video_height=video_height,
             duration=duration,
             sample_interval=actual_interval,
             faces=faces,
+            target_face_count=target_count,
+            stopped_early=stopped_early,
+            stopped_by_user=stopped_by_user,
+            samples_scanned=samples_scanned,
         )
     finally:
         capture.release()
@@ -484,8 +556,12 @@ def _make_thumbnail(cv2: object, np: object, frame: object, box: FaceBox) -> byt
     return encoded.tobytes() if encoded_ok else b""
 
 
+def _minimum_track_hits(sample_interval: float) -> int:
+    return 2 if sample_interval < 4.0 else 1
+
+
 def _finalize_tracks(tracks: Sequence[_FaceTrack], sample_interval: float) -> tuple[DetectedFace, ...]:
-    minimum_hits = 2 if sample_interval < 4.0 else 1
+    minimum_hits = _minimum_track_hits(sample_interval)
     kept = [track for track in tracks if len(track.boxes) >= minimum_hits]
     kept.sort(
         key=lambda track: (
@@ -523,3 +599,8 @@ def _median(values: Sequence[float | int]) -> float:
 def _emit(progress_callback: FaceProgressCallback | None, value: float, status: str) -> None:
     if progress_callback is not None:
         progress_callback(max(0.0, min(1.0, value)), status)
+
+
+def _emit_count(count_callback: FaceCountCallback | None, count: int) -> None:
+    if count_callback is not None:
+        count_callback(max(0, int(count)))
