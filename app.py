@@ -6,10 +6,13 @@ import sys
 from pathlib import Path
 
 from speech_cutter.captions import CaptionSettings
+from speech_cutter.faces import DEFAULT_FACE_MAX_ZOOM, DEFAULT_FACE_PADDING
 from speech_cutter.gui import launch_gui
 from speech_cutter.pipeline import (
+    CropSettings,
     DEFAULT_PUSH_IN_MAX_ZOOM,
     DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS,
+    FaceZoomSettings,
     MotionSettings,
     build_output_path,
     check_runtime,
@@ -126,8 +129,36 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_PUSH_IN_MAX_ZOOM,
         help="Final push-in zoom amount, such as 1.08 for an 8 percent zoom.",
     )
+    parser.add_argument(
+        "--face-zoom",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Detect faces and zoom speech segments toward a face instead of the manual crop.",
+    )
+    parser.add_argument(
+        "--face-id",
+        type=int,
+        action="append",
+        default=[],
+        metavar="N",
+        help="Face id to follow (repeatable). Detected ids are printed during the run. Omit for automatic selection.",
+    )
+    parser.add_argument(
+        "--face-padding",
+        type=float,
+        default=DEFAULT_FACE_PADDING,
+        help="Extra space around a detected face, as a fraction of face size (default 0.35).",
+    )
+    parser.add_argument(
+        "--face-max-zoom",
+        type=float,
+        default=DEFAULT_FACE_MAX_ZOOM,
+        help="Maximum face zoom, such as 1.8 for 80 percent.",
+    )
     args = parser.parse_args(argv)
 
+    if args.face_id and not args.face_zoom:
+        parser.error("--face-id requires --face-zoom")
     if args.ai_transcript_correction and not args.captions:
         parser.error("--ai-transcript-correction requires --captions")
     if args.ai_transcript_correction and not str(args.gemini_api_key).strip():
@@ -164,6 +195,23 @@ def main(argv: list[str] | None = None) -> int:
                 push_in_enabled=bool(args.push_in),
                 push_in_min_segment_seconds=max(0.0, float(args.push_in_min_seconds)),
                 push_in_max_zoom=max(1.001, float(args.push_in_zoom)),
+            ),
+            crop=(
+                CropSettings(
+                    enabled=True,
+                    every_n_segments=1,
+                    min_segment_seconds=0.0,
+                    zoom_duration_seconds=0.0,
+                    mid_zoom_on_long_segments=False,
+                )
+                if args.face_zoom
+                else None
+            ),
+            faces=FaceZoomSettings(
+                enabled=bool(args.face_zoom),
+                selected_face_ids=tuple(args.face_id),
+                padding=max(0.0, float(args.face_padding)),
+                max_zoom=max(1.01, float(args.face_max_zoom)),
             ),
             captions=CaptionSettings(
                 enabled=bool(args.captions),

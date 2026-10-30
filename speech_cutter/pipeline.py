@@ -14,6 +14,19 @@ import tempfile
 import time
 
 from .captions import CaptionArtifactResult, CaptionSettings, create_caption_artifacts, needs_transcription
+from .faces import (
+    DEFAULT_FACE_MAX_ZOOM,
+    DEFAULT_FACE_PADDING,
+    DetectedFace,
+    FaceAnalysis,
+    FaceBox,
+    FaceDetectionCancelledError,
+    FaceDetectionError,
+    choose_face_for_range,
+    compute_face_crop,
+    detect_faces,
+    face_box_for_range,
+)
 from .vad import (
     DetectionCancelledError,
     SileroOnnxVad,
@@ -49,6 +62,7 @@ class ProcessingOptions:
     vad: VadSettings = field(default_factory=VadSettings)
     crop: "CropSettings" = field(default_factory=lambda: CropSettings())
     motion: "MotionSettings" = field(default_factory=lambda: MotionSettings())
+    faces: "FaceZoomSettings" = field(default_factory=lambda: FaceZoomSettings())
     background_music: "BackgroundMusicSettings" = field(default_factory=lambda: BackgroundMusicSettings())
     audio_boost: "AudioBoostSettings" = field(default_factory=lambda: AudioBoostSettings())
     captions: CaptionSettings = field(default_factory=CaptionSettings)
@@ -75,6 +89,21 @@ class MotionSettings:
     push_in_enabled: bool = False
     push_in_min_segment_seconds: float = DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS
     push_in_max_zoom: float = DEFAULT_PUSH_IN_MAX_ZOOM
+
+
+@dataclass(frozen=True)
+class FaceZoomSettings:
+    """Face-targeted zoom configuration.
+
+    ``faces`` can be supplied by the GUI after a preview scan. When it is empty
+    and ``enabled`` is true, the pipeline scans the source video itself (CLI use).
+    """
+
+    enabled: bool = False
+    faces: tuple[DetectedFace, ...] = ()
+    selected_face_ids: tuple[int, ...] = ()
+    padding: float = DEFAULT_FACE_PADDING
+    max_zoom: float = DEFAULT_FACE_MAX_ZOOM
 
 
 @dataclass(frozen=True)
@@ -242,14 +271,34 @@ def process_video(
                 )
                 _log(log_callback, f"Aligned segment edges to the video frame grid ({video_fps:.3f} fps) to keep sync stable.")
 
+        video_width = _as_int(metadata.get("video_width"))
+        video_height = _as_int(metadata.get("video_height"))
         crop_settings = _prepare_crop_settings(
             options.crop,
-            video_width=_as_int(metadata.get("video_width")),
-            video_height=_as_int(metadata.get("video_height")),
+            video_width=video_width,
+            video_height=video_height,
+            allow_missing_rect=bool(options.faces.enabled),
         )
         motion_settings = _prepare_motion_settings(options.motion)
         background_music_settings = _prepare_background_music_settings(options.background_music)
         audio_boost_settings = _prepare_audio_boost_settings(options.audio_boost)
+
+        face_scan_needed = bool(options.faces.enabled and not options.faces.faces)
+        face_scan_end = 0.50 if transcription_needed else 0.60
+        face_settings = _prepare_face_zoom_settings(
+            options.faces,
+            input_path,
+            video_width=video_width,
+            video_height=video_height,
+            duration=float(metadata["duration"]),
+            progress_start=detection_end,
+            progress_end=face_scan_end,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+        caption_start = 0.50 if (transcription_needed and face_scan_needed) else detection_end
+        render_start = 0.65 if transcription_needed else (0.60 if face_scan_needed else detection_end)
 
         kept_duration = sum(segment.duration for segment in segments)
         _log(
@@ -283,7 +332,7 @@ def process_video(
                 metadata=metadata,
                 segments=segments,
                 kept_duration=kept_duration,
-                progress_start=detection_end,
+                progress_start=caption_start,
                 progress_end=0.65,
                 progress_callback=progress_callback,
                 log_callback=log_callback,
@@ -297,6 +346,7 @@ def process_video(
                 video_height=_as_int(metadata.get("video_height")),
                 crop_settings=crop_settings,
                 motion_settings=motion_settings,
+                face_settings=face_settings,
                 background_music_settings=background_music_settings,
                 audio_boost_settings=audio_boost_settings,
                 kept_duration=kept_duration,
@@ -359,7 +409,7 @@ def process_video(
             _run_ffmpeg_with_progress(
                 render_command,
                 total_duration=max(kept_duration, 0.001),
-                progress_start=0.65 if transcription_needed else detection_end,
+                progress_start=render_start,
                 progress_end=1.00,
                 status="Rendering output video on the GPU..." if use_nvenc else "Rendering output video...",
                 progress_callback=progress_callback,
@@ -381,7 +431,7 @@ def process_video(
             _run_ffmpeg_with_progress(
                 cpu_render_command,
                 total_duration=max(kept_duration, 0.001),
-                progress_start=0.65 if transcription_needed else detection_end,
+                progress_start=render_start,
                 progress_end=1.00,
                 status="Rendering output video on the CPU...",
                 progress_callback=progress_callback,
@@ -524,6 +574,7 @@ def _build_filter_script(
     background_music_settings: BackgroundMusicSettings | None,
     audio_boost_settings: AudioBoostSettings | None,
     kept_duration: float,
+    face_settings: FaceZoomSettings | None = None,
     caption_artifacts: CaptionArtifactResult | None = None,
 ) -> str:
     lines: list[str] = []
@@ -531,6 +582,9 @@ def _build_filter_script(
         segments,
         crop_settings=crop_settings,
         motion_settings=motion_settings,
+        face_settings=face_settings,
+        video_width=video_width,
+        video_height=video_height,
     )
     for index, clip in enumerate(clip_specs):
         segment = clip.segment
@@ -547,6 +601,13 @@ def _build_filter_script(
                 f"crop=w={crop_settings.width}:h={crop_settings.height}:x={crop_settings.x}:y={crop_settings.y}"
             )
             video_filters.append(f"scale={video_width}:{video_height}:flags=lanczos")
+        elif clip.effect == "face_crop":
+            assert clip.crop_rect is not None
+            crop_x, crop_y, crop_width, crop_height = clip.crop_rect
+            video_filters.append(
+                f"crop=w={crop_width}:h={crop_height}:x={crop_x}:y={crop_y}"
+            )
+            video_filters.append(f"scale={video_width}:{video_height}:flags=lanczos")
         elif clip.effect == "push_in":
             assert motion_settings is not None
             video_filters.extend(
@@ -555,6 +616,7 @@ def _build_filter_script(
                     video_height=video_height,
                     segment_duration=segment.duration,
                     max_zoom=motion_settings.push_in_max_zoom,
+                    target_center=clip.face_center,
                 )
             )
         video_filters.append("setsar=1")
@@ -606,6 +668,8 @@ def _build_filter_script(
 class ClipSpec:
     segment: SpeechSegment
     effect: str = "none"
+    crop_rect: tuple[int, int, int, int] | None = None
+    face_center: tuple[int, int] | None = None
 
 
 def _expand_segment_clips(
@@ -613,6 +677,9 @@ def _expand_segment_clips(
     *,
     crop_settings: CropSettings | None,
     motion_settings: MotionSettings | None,
+    face_settings: FaceZoomSettings | None = None,
+    video_width: int = 0,
+    video_height: int = 0,
 ) -> list[ClipSpec]:
     clips: list[ClipSpec] = []
     for index, segment in enumerate(segments, start=1):
@@ -623,6 +690,9 @@ def _expand_segment_clips(
                 should_crop=should_crop,
                 crop_settings=crop_settings,
                 motion_settings=motion_settings,
+                face_settings=face_settings,
+                video_width=video_width,
+                video_height=video_height,
             )
         )
     return clips
@@ -634,18 +704,125 @@ def _split_segment_for_effects(
     should_crop: bool,
     crop_settings: CropSettings | None,
     motion_settings: MotionSettings | None,
+    face_settings: FaceZoomSettings | None,
+    video_width: int,
+    video_height: int,
 ) -> list[ClipSpec]:
     if crop_settings is not None:
         if should_crop:
-            return _build_zoom_clips(segment, crop_settings=crop_settings, alignment="start")
+            face_clip = _build_face_zoom_clips(
+                segment,
+                face_settings=face_settings,
+                crop_settings=crop_settings,
+                video_width=video_width,
+                video_height=video_height,
+                alignment="start",
+            )
+            if face_clip is not None:
+                return face_clip
+            if crop_settings.width > 0 and crop_settings.height > 0:
+                return _build_zoom_clips(segment, crop_settings=crop_settings, alignment="start")
 
         if _should_apply_middle_zoom(segment, crop_settings):
-            return _build_zoom_clips(segment, crop_settings=crop_settings, alignment="middle")
+            face_clip = _build_face_zoom_clips(
+                segment,
+                face_settings=face_settings,
+                crop_settings=crop_settings,
+                video_width=video_width,
+                video_height=video_height,
+                alignment="middle",
+            )
+            if face_clip is not None:
+                return face_clip
+            if crop_settings.width > 0 and crop_settings.height > 0:
+                return _build_zoom_clips(segment, crop_settings=crop_settings, alignment="middle")
 
     if _should_apply_push_in(segment, motion_settings):
-        return [ClipSpec(segment, "push_in")]
+        face_center = _face_center_for_segment(
+            segment,
+            face_settings=face_settings,
+            video_width=video_width,
+            video_height=video_height,
+        )
+        return [ClipSpec(segment, "push_in", face_center=face_center)]
 
     return [ClipSpec(segment)]
+
+
+def _build_face_zoom_clips(
+    segment: SpeechSegment,
+    *,
+    face_settings: FaceZoomSettings | None,
+    crop_settings: CropSettings,
+    video_width: int,
+    video_height: int,
+    alignment: str,
+) -> list[ClipSpec] | None:
+    if face_settings is None:
+        return None
+    target_box = _face_box_for_segment(
+        segment,
+        face_settings=face_settings,
+        video_width=video_width,
+        video_height=video_height,
+    )
+    if target_box is None:
+        return None
+    crop_rect = compute_face_crop(
+        target_box,
+        frame_width=video_width,
+        frame_height=video_height,
+        padding=face_settings.padding,
+        max_zoom=face_settings.max_zoom,
+    )
+    if crop_rect is None:
+        return None
+    return _build_zoom_clips(
+        segment,
+        crop_settings=crop_settings,
+        alignment=alignment,
+        effect="face_crop",
+        crop_rect=crop_rect,
+    )
+
+
+def _face_box_for_segment(
+    segment: SpeechSegment,
+    *,
+    face_settings: FaceZoomSettings,
+    video_width: int,
+    video_height: int,
+) -> FaceBox | None:
+    face = choose_face_for_range(
+        face_settings.faces,
+        segment.start,
+        segment.end,
+        selected_face_ids=face_settings.selected_face_ids,
+    )
+    if face is None:
+        return None
+    return face_box_for_range(face, segment.start, segment.end)
+
+
+def _face_center_for_segment(
+    segment: SpeechSegment,
+    *,
+    face_settings: FaceZoomSettings | None,
+    video_width: int,
+    video_height: int,
+) -> tuple[int, int] | None:
+    if face_settings is None:
+        return None
+    box = _face_box_for_segment(
+        segment,
+        face_settings=face_settings,
+        video_width=video_width,
+        video_height=video_height,
+    )
+    if box is None:
+        return None
+    center_x, center_y = box.center
+    return int(round(center_x)), int(round(center_y))
 
 
 def _should_apply_middle_zoom(
@@ -667,10 +844,12 @@ def _build_zoom_clips(
     *,
     crop_settings: CropSettings,
     alignment: str,
+    effect: str = "crop",
+    crop_rect: tuple[int, int, int, int] | None = None,
 ) -> list[ClipSpec]:
     zoom_duration = crop_settings.zoom_duration_seconds
     if zoom_duration <= 0 or segment.duration <= zoom_duration:
-        return [ClipSpec(segment, "crop")]
+        return [ClipSpec(segment, effect, crop_rect=crop_rect)]
 
     if alignment == "middle":
         padding = max((segment.duration - zoom_duration) / 2.0, 0.0)
@@ -685,7 +864,7 @@ def _build_zoom_clips(
     clips: list[ClipSpec] = []
     if zoom_start > segment.start:
         clips.append(ClipSpec(SpeechSegment(segment.start, zoom_start)))
-    clips.append(ClipSpec(SpeechSegment(zoom_start, zoom_end), "crop"))
+    clips.append(ClipSpec(SpeechSegment(zoom_start, zoom_end), effect, crop_rect=crop_rect))
     if zoom_end < segment.end:
         clips.append(ClipSpec(SpeechSegment(zoom_end, segment.end)))
     return clips
@@ -706,10 +885,18 @@ def _build_push_in_filters(
     video_height: int,
     segment_duration: float,
     max_zoom: float,
+    target_center: tuple[int, int] | None = None,
 ) -> list[str]:
     zoom_delta = max(0.0, max_zoom - 1.0)
     duration = max(segment_duration, 0.001)
     zoom_expr = f"1+{zoom_delta:.6f}*(1-cos(PI*min(t/{duration:.6f},1)))/2"
+    if target_center is None:
+        x_expr = "(iw-ow)/2"
+        y_expr = "(ih-oh)/2"
+    else:
+        target_x, target_y = target_center
+        x_expr = f"max(0,min(iw-ow,{target_x:.3f}*({zoom_expr})-{video_width}/2))"
+        y_expr = f"max(0,min(ih-oh,{target_y:.3f}*({zoom_expr})-{video_height}/2))"
     return [
         (
             "scale="
@@ -717,7 +904,7 @@ def _build_push_in_filters(
             f"h='trunc(ih*({zoom_expr})/2)*2':"
             "eval=frame:flags=lanczos"
         ),
-        f"crop=w={video_width}:h={video_height}:x='(iw-ow)/2':y='(ih-oh)/2'",
+        f"crop=w={video_width}:h={video_height}:x='{x_expr}':y='{y_expr}'",
     ]
 
 
@@ -1175,25 +1362,31 @@ def _prepare_crop_settings(
     *,
     video_width: int,
     video_height: int,
+    allow_missing_rect: bool = False,
 ) -> CropSettings | None:
     if not crop.enabled:
         return None
 
     if video_width <= 0 or video_height <= 0:
         raise ProcessingError("Could not read the source video size needed for crop/zoom.")
-    if crop.width <= 0 or crop.height <= 0:
-        raise ProcessingError("Crop width and height must be greater than zero.")
-    if crop.x < 0 or crop.y < 0:
-        raise ProcessingError("Crop X and Y must be zero or positive.")
-    if crop.x + crop.width > video_width or crop.y + crop.height > video_height:
-        raise ProcessingError(
-            f"Crop rectangle must stay inside the source video ({video_width}x{video_height})."
-        )
-    aspect_error = abs((crop.width * video_height) - (crop.height * video_width))
-    if aspect_error > max(video_width, video_height):
-        raise ProcessingError(
-            "Crop must keep the same aspect ratio as the source video so zoomed segments do not stretch."
-        )
+    has_rect = crop.width > 0 or crop.height > 0
+    if not has_rect:
+        if not allow_missing_rect:
+            raise ProcessingError("Crop width and height must be greater than zero.")
+    else:
+        if crop.width <= 0 or crop.height <= 0:
+            raise ProcessingError("Crop width and height must be greater than zero.")
+        if crop.x < 0 or crop.y < 0:
+            raise ProcessingError("Crop X and Y must be zero or positive.")
+        if crop.x + crop.width > video_width or crop.y + crop.height > video_height:
+            raise ProcessingError(
+                f"Crop rectangle must stay inside the source video ({video_width}x{video_height})."
+            )
+        aspect_error = abs((crop.width * video_height) - (crop.height * video_width))
+        if aspect_error > max(video_width, video_height):
+            raise ProcessingError(
+                "Crop must keep the same aspect ratio as the source video so zoomed segments do not stretch."
+            )
     if crop.every_n_segments < 1:
         raise ProcessingError("Crop cadence must be at least 1.")
     if crop.min_segment_seconds < 0:
@@ -1204,6 +1397,83 @@ def _prepare_crop_settings(
         raise ProcessingError("Long-segment middle zoom threshold cannot be negative.")
 
     return crop
+
+
+def _prepare_face_zoom_settings(
+    faces: FaceZoomSettings,
+    input_path: Path,
+    *,
+    video_width: int,
+    video_height: int,
+    duration: float,
+    progress_start: float,
+    progress_end: float,
+    progress_callback: ProgressCallback | None,
+    log_callback: LogCallback | None,
+    cancel_callback: CancelCallback | None,
+) -> FaceZoomSettings | None:
+    if not faces.enabled:
+        return None
+    if video_width <= 0 or video_height <= 0:
+        raise ProcessingError("Could not read the source video size needed for face zoom.")
+    if not 0.0 <= faces.padding <= 1.5:
+        raise ProcessingError("Face padding must be between 0 and 150 percent.")
+    if not 1.01 <= faces.max_zoom <= 4.0:
+        raise ProcessingError("Face zoom must be between 1.01x and 4.0x.")
+
+    detected_faces = tuple(faces.faces)
+    if not detected_faces:
+        _ensure_not_cancelled(cancel_callback)
+        _log(log_callback, "Scanning the video for distinct faces.")
+        try:
+            analysis: FaceAnalysis = detect_faces(
+                input_path,
+                duration=duration,
+                progress_callback=lambda ratio, status: _emit_progress(
+                    progress_callback,
+                    progress_start + max(0.0, min(ratio, 1.0)) * (progress_end - progress_start),
+                    status,
+                ),
+                cancel_callback=cancel_callback,
+            )
+        except FaceDetectionCancelledError as exc:
+            raise UserCancelledError("Face detection was cancelled.") from exc
+        except FaceDetectionError as exc:
+            raise ProcessingError(str(exc)) from exc
+        detected_faces = analysis.faces
+        _log(log_callback, f"Detected {len(detected_faces)} distinct face track(s).")
+
+    if detected_faces:
+        face_summary = ", ".join(
+            f"#{face.face_id} ({face.screen_time:.1f}s)" for face in detected_faces
+        )
+        _log(log_callback, f"Detected face ids: {face_summary}.")
+
+    if not detected_faces:
+        _log(log_callback, "No faces were detected; face-targeted zooms will be skipped.")
+        return None
+
+    selected_ids = tuple(int(face_id) for face_id in faces.selected_face_ids)
+    valid_ids = {face.face_id for face in detected_faces}
+    if selected_ids:
+        missing_ids = sorted(set(selected_ids) - valid_ids)
+        if missing_ids:
+            available = ", ".join(str(face_id) for face_id in sorted(valid_ids))
+            missing = ", ".join(str(face_id) for face_id in missing_ids)
+            raise ProcessingError(
+                f"Selected face(s) {missing} were not found in the video. Available face ids: {available}."
+            )
+        _log(log_callback, f"Using selected face(s): {', '.join(str(face_id) for face_id in selected_ids)}.")
+    else:
+        _log(log_callback, "Face selection is automatic; the largest visible face will be used per segment.")
+
+    return FaceZoomSettings(
+        enabled=True,
+        faces=detected_faces,
+        selected_face_ids=selected_ids,
+        padding=float(faces.padding),
+        max_zoom=float(faces.max_zoom),
+    )
 
 
 def _prepare_motion_settings(motion: MotionSettings) -> MotionSettings | None:

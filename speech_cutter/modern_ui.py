@@ -5,6 +5,8 @@ import tkinter as tk
 
 import customtkinter as ctk
 
+from .faces import FACE_ZOOM_LABEL, MANUAL_ZOOM_LABEL
+
 
 BG = "#090D18"
 SURFACE = "#0F1628"
@@ -423,27 +425,67 @@ def build_main_layout(app: tk.Misc) -> None:
     _switch(crop_body, "Włącz dynamiczny kadr", app.crop_enabled_var, app._update_crop_state).grid(
         row=0, column=0, sticky="w"
     )
+    target_row = ctk.CTkFrame(crop_body, fg_color="transparent")
+    target_row.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+    target_row.grid_columnconfigure(1, weight=1)
+    _label(target_row, "Cel przybliżeń").grid(row=0, column=0, sticky="w")
+    app.zoom_target_control = ctk.CTkSegmentedButton(
+        target_row,
+        values=(MANUAL_ZOOM_LABEL, FACE_ZOOM_LABEL),
+        variable=app.zoom_target_var,
+        command=lambda _value: app._on_zoom_target_changed(),
+        height=36,
+        corner_radius=9,
+        fg_color=INPUT,
+        selected_color=ACCENT,
+        selected_hover_color=ACCENT_HOVER,
+        unselected_color=INPUT,
+        unselected_hover_color=CARD_HOVER,
+        text_color=TEXT,
+        font=_font(12, "bold"),
+    )
+    app.zoom_target_control.grid(row=0, column=1, sticky="e", padx=(14, 0))
+
     crop_actions = ctk.CTkFrame(crop_body, fg_color="transparent")
-    crop_actions.grid(row=1, column=0, sticky="w", pady=(14, 0))
+    crop_actions.grid(row=2, column=0, sticky="w", pady=(14, 0))
     app.pick_crop_button = _button(crop_actions, "Wybierz kadr", app._choose_crop_visually, primary=True, width=125)
     app.pick_crop_button.grid(row=0, column=0)
     app.pick_queue_crops_button = _button(crop_actions, "Kadry dla kolejki", app._choose_crops_for_queue, width=145)
     app.pick_queue_crops_button.grid(row=0, column=1, padx=(8, 0))
     app.clear_crop_button = _button(crop_actions, "Wyczyść", app._clear_crop_selection, width=92)
     app.clear_crop_button.grid(row=0, column=2, padx=(8, 0))
+
+    face_actions = ctk.CTkFrame(crop_body, fg_color="transparent")
+    face_actions.grid(row=3, column=0, sticky="w", pady=(10, 0))
+    app.detect_faces_button = _button(face_actions, "Wykryj twarze", app._detect_faces_clicked, primary=True, width=135)
+    app.detect_faces_button.grid(row=0, column=0)
+    app.choose_faces_button = _button(face_actions, "Wybierz twarze", app._choose_faces_clicked, width=140, state="disabled")
+    app.choose_faces_button.grid(row=0, column=1, padx=(8, 0))
+
     _label(crop_body, textvariable=app.crop_summary_var, wraplength=560).grid(
-        row=2, column=0, sticky="w", pady=(12, 0)
+        row=4, column=0, sticky="w", pady=(12, 0)
+    )
+    _label(crop_body, textvariable=app.face_summary_var, wraplength=560).grid(
+        row=5, column=0, sticky="w", pady=(5, 0)
+    )
+    app.face_padding_scale = _slider(
+        crop_body, row=6, label="Oddech wokół twarzy", value_variable=app.face_padding_value_var,
+        variable=app.face_padding_percent_var, start=0.0, end=80.0, command=app._on_face_padding_scale
+    )
+    app.face_max_zoom_scale = _slider(
+        crop_body, row=8, label="Limit przybliżenia twarzy", value_variable=app.face_max_zoom_value_var,
+        variable=app.face_max_zoom_var, start=1.1, end=2.5, command=app._on_face_max_zoom_scale
     )
     app.crop_every_scale = _slider(
-        crop_body, row=3, label="Co który segment mowy", value_variable=app.crop_every_value_var,
+        crop_body, row=10, label="Co który segment mowy", value_variable=app.crop_every_value_var,
         variable=app.crop_every_var, start=1, end=12, command=app._on_crop_every_scale
     )
     app.crop_min_scale = _slider(
-        crop_body, row=5, label="Pomiń segmenty krótsze niż", value_variable=app.crop_min_seconds_value_var,
+        crop_body, row=12, label="Pomiń segmenty krótsze niż", value_variable=app.crop_min_seconds_value_var,
         variable=app.crop_min_seconds_var, start=0.0, end=10.0, command=app._on_crop_min_scale
     )
     app.crop_zoom_scale = _slider(
-        crop_body, row=7, label="Czas przybliżenia", value_variable=app.crop_zoom_seconds_value_var,
+        crop_body, row=14, label="Czas przybliżenia", value_variable=app.crop_zoom_seconds_value_var,
         variable=app.crop_zoom_seconds_var, start=0.0, end=10.0, command=app._on_crop_zoom_scale
     )
 
@@ -474,11 +516,15 @@ def build_main_layout(app: tk.Misc) -> None:
         motion_body, row=7, label="Końcowe przybliżenie", value_variable=app.push_in_zoom_percent_value_var,
         variable=app.push_in_zoom_percent_var, start=2.0, end=25.0, command=app._on_push_in_zoom_scale
     )
-    app._crop_widgets = [
+    app._manual_crop_widgets = [
         app.pick_crop_button, app.pick_queue_crops_button, app.clear_crop_button,
+    ]
+    app._shared_crop_widgets = [
         app.crop_every_scale, app.crop_min_scale, app.crop_zoom_scale,
         app.crop_middle_long_check, app.crop_middle_long_threshold_scale,
     ]
+    app._crop_widgets = [*app._manual_crop_widgets, *app._shared_crop_widgets]
+    app._face_setting_widgets = [app.face_padding_scale, app.face_max_zoom_scale]
 
     # Audio page.
     audio_page = pages["Dźwięk"]

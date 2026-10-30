@@ -5,6 +5,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Callable
+import base64
 import json
 import math
 import os
@@ -25,6 +26,17 @@ from .credentials import (
     load_api_key,
     save_api_key,
 )
+from .faces import (
+    DEFAULT_FACE_MAX_ZOOM,
+    DEFAULT_FACE_PADDING,
+    FACE_ZOOM_LABEL,
+    MANUAL_ZOOM_LABEL,
+    DetectedFace,
+    FaceAnalysis,
+    FaceDetectionCancelledError,
+    FaceDetectionError,
+    detect_faces,
+)
 from .pipeline import (
     AudioBoostSettings,
     BackgroundMusicSettings,
@@ -33,6 +45,7 @@ from .pipeline import (
     DEFAULT_MID_ZOOM_MIN_SEGMENT_SECONDS,
     DEFAULT_PUSH_IN_MAX_ZOOM,
     DEFAULT_PUSH_IN_MIN_SEGMENT_SECONDS,
+    FaceZoomSettings,
     MotionSettings,
     NoSpeechDetectedError,
     ProcessingOptions,
@@ -81,6 +94,8 @@ class QueuedVideo:
     path: Path
     metadata: dict[str, int | float | bool | None] = field(default_factory=dict)
     crop_rect: tuple[int, int, int, int] | None = None
+    face_analysis: FaceAnalysis | None = None
+    selected_face_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -154,6 +169,24 @@ def _read_saved_audio_boost_gain_db() -> float:
         return DEFAULT_AUDIO_BOOST_GAIN_DB
 
 
+def _read_saved_face_padding_percent() -> float:
+    settings = _load_app_settings()
+    value = settings.get("face_padding_percent")
+    try:
+        return min(80.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_FACE_PADDING * 100.0
+
+
+def _read_saved_face_max_zoom() -> float:
+    settings = _load_app_settings()
+    value = settings.get("face_max_zoom")
+    try:
+        return min(2.5, max(1.1, float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_FACE_MAX_ZOOM
+
+
 class PreviewLoadingDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, *, video_name: str) -> None:
         super().__init__(parent)
@@ -193,6 +226,294 @@ class PreviewLoadingDialog(tk.Toplevel):
         except Exception:
             pass
         super().destroy()
+
+    def _activate_dialog(self) -> None:
+        try:
+            self.grab_set()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+
+class FaceScanDialog(ctk.CTkToplevel):
+    def __init__(self, parent: tk.Misc, *, video_name: str) -> None:
+        super().__init__(parent)
+        self.title("Wykrywanie twarzy")
+        self.geometry("540x260")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.configure(fg_color="#090D18")
+        self.cancel_event = threading.Event()
+
+        frame = ctk.CTkFrame(
+            self,
+            fg_color="#131C30",
+            corner_radius=18,
+            border_width=1,
+            border_color="#25314B",
+        )
+        frame.pack(fill="both", expand=True, padx=14, pady=14)
+        frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            frame,
+            text=f"Szukam twarzy w:\n{video_name}",
+            text_color="#F8FAFC",
+            font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+            anchor="w",
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew", padx=22, pady=(22, 6))
+        ctk.CTkLabel(
+            frame,
+            text="Analiza próbkuje klatki i grupuje twarze w osobne wystąpienia.",
+            text_color="#91A0B8",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            anchor="w",
+            justify="left",
+            wraplength=460,
+        ).grid(row=1, column=0, sticky="ew", padx=22)
+        self._status_var = tk.StringVar(value="Przygotowuję skanowanie...")
+        ctk.CTkLabel(
+            frame,
+            textvariable=self._status_var,
+            text_color="#91A0B8",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            anchor="w",
+            justify="left",
+            wraplength=460,
+        ).grid(row=2, column=0, sticky="ew", padx=22, pady=(16, 6))
+        self._progress = ctk.CTkProgressBar(
+            frame,
+            height=8,
+            corner_radius=4,
+            fg_color="#0B1222",
+            progress_color="#7C5CFC",
+        )
+        self._progress.set(0.0)
+        self._progress.grid(row=3, column=0, sticky="ew", padx=22)
+        self._cancel_button = ctk.CTkButton(
+            frame,
+            text="Anuluj",
+            command=self._request_cancel,
+            width=110,
+            height=38,
+            corner_radius=10,
+            fg_color="#3A1D2A",
+            hover_color="#542336",
+            text_color="#FB7185",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+        )
+        self._cancel_button.grid(row=4, column=0, sticky="e", padx=22, pady=(16, 20))
+
+        self.protocol("WM_DELETE_WINDOW", self._request_cancel)
+        self.update_idletasks()
+        self.after_idle(self._activate_dialog)
+
+    def set_progress(self, value: float, status: str) -> None:
+        self._progress.set(max(0.0, min(1.0, float(value))))
+        self._status_var.set(status)
+
+    def _request_cancel(self) -> None:
+        self.cancel_event.set()
+        self._cancel_button.configure(state="disabled")
+        self._status_var.set("Anulowanie...")
+
+    def _activate_dialog(self) -> None:
+        try:
+            self.grab_set()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+
+class FaceSelectionDialog(ctk.CTkToplevel):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        analysis: FaceAnalysis,
+        selected_ids: tuple[int, ...],
+    ) -> None:
+        super().__init__(parent)
+        self.title("Wybierz twarze do przybliżeń")
+        self.geometry("900x640")
+        self.minsize(720, 520)
+        self.transient(parent)
+        self.configure(fg_color="#090D18")
+        self.result: tuple[int, ...] | None = None
+        self._images: list[tk.PhotoImage] = []
+        self._face_vars: dict[int, tk.BooleanVar] = {}
+        selected = set(selected_ids)
+
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=24, pady=(22, 0))
+        ctk.CTkLabel(
+            header,
+            text="Które twarze przybliżać?",
+            text_color="#F8FAFC",
+            font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
+            anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            header,
+            text=(
+                "Zaznacz jedną lub kilka twarzy. Gdy nic nie zaznaczysz, aplikacja automatycznie "
+                "wybierze największą widoczną twarz w każdym segmencie."
+            ),
+            text_color="#91A0B8",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            anchor="w",
+            justify="left",
+            wraplength=820,
+        ).pack(anchor="w", pady=(6, 0))
+
+        grid = ctk.CTkScrollableFrame(
+            self,
+            fg_color="transparent",
+            corner_radius=0,
+            scrollbar_button_color="#25314B",
+            scrollbar_button_hover_color="#7C5CFC",
+        )
+        grid.pack(fill="both", expand=True, padx=18, pady=(16, 0))
+        for column in range(4):
+            grid.grid_columnconfigure(column, weight=1, uniform="faces")
+
+        for index, face in enumerate(analysis.faces):
+            card = ctk.CTkFrame(
+                grid,
+                fg_color="#131C30",
+                corner_radius=14,
+                border_width=1,
+                border_color="#25314B",
+            )
+            card.grid(
+                row=index // 4,
+                column=index % 4,
+                sticky="nsew",
+                padx=6,
+                pady=6,
+            )
+            photo = self._make_photo(face)
+            if photo is not None:
+                tk.Label(card, image=photo, bg="#131C30", bd=0).pack(padx=12, pady=(12, 6))
+            else:
+                ctk.CTkLabel(
+                    card,
+                    text="Brak podglądu",
+                    text_color="#64748B",
+                    width=160,
+                    height=140,
+                ).pack(padx=12, pady=(12, 6))
+            ctk.CTkLabel(
+                card,
+                text=f"Twarz #{face.face_id}",
+                text_color="#F8FAFC",
+                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            ).pack(anchor="w", padx=14)
+            ctk.CTkLabel(
+                card,
+                text=f"W kadrze {face.screen_time:.1f} s",
+                text_color="#91A0B8",
+                font=ctk.CTkFont(family="Segoe UI", size=11),
+            ).pack(anchor="w", padx=14, pady=(2, 0))
+            variable = tk.BooleanVar(value=face.face_id in selected)
+            self._face_vars[face.face_id] = variable
+            ctk.CTkCheckBox(
+                card,
+                text="Śledź tę twarz",
+                variable=variable,
+                width=20,
+                height=20,
+                corner_radius=6,
+                border_width=2,
+                border_color="#475569",
+                fg_color="#7C5CFC",
+                hover_color="#9278FF",
+                text_color="#F8FAFC",
+                font=ctk.CTkFont(family="Segoe UI", size=12),
+            ).pack(anchor="w", padx=12, pady=(10, 14))
+
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=24, pady=(12, 20))
+        footer.grid_columnconfigure(2, weight=1)
+        ctk.CTkButton(
+            footer,
+            text="Zaznacz wszystkie",
+            command=lambda: self._set_all(True),
+            width=130,
+            height=38,
+            corner_radius=10,
+            fg_color="#18233A",
+            hover_color="#25314B",
+            text_color="#F8FAFC",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            footer,
+            text="Wyczyść",
+            command=lambda: self._set_all(False),
+            width=90,
+            height=38,
+            corner_radius=10,
+            fg_color="#18233A",
+            hover_color="#25314B",
+            text_color="#F8FAFC",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+        ).grid(row=0, column=1, padx=(8, 0), sticky="w")
+        ctk.CTkButton(
+            footer,
+            text="Anuluj",
+            command=self._cancel,
+            width=100,
+            height=38,
+            corner_radius=10,
+            fg_color="#18233A",
+            hover_color="#25314B",
+            text_color="#F8FAFC",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+        ).grid(row=0, column=3, padx=(8, 0))
+        ctk.CTkButton(
+            footer,
+            text="Zastosuj",
+            command=self._apply,
+            width=120,
+            height=38,
+            corner_radius=10,
+            fg_color="#7C5CFC",
+            hover_color="#9278FF",
+            text_color="#FFFFFF",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+        ).grid(row=0, column=4, padx=(8, 0))
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.update_idletasks()
+        self.after_idle(self._activate_dialog)
+
+    def _make_photo(self, face: DetectedFace) -> tk.PhotoImage | None:
+        if not face.thumbnail_png:
+            return None
+        try:
+            photo = tk.PhotoImage(data=base64.b64encode(face.thumbnail_png).decode("ascii"))
+        except tk.TclError:
+            return None
+        self._images.append(photo)
+        return photo
+
+    def _set_all(self, value: bool) -> None:
+        for variable in self._face_vars.values():
+            variable.set(value)
+
+    def _apply(self) -> None:
+        self.result = tuple(
+            sorted(face_id for face_id, variable in self._face_vars.items() if variable.get())
+        )
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
 
     def _activate_dialog(self) -> None:
         try:
@@ -952,10 +1273,14 @@ class SpeechCutterApp(ctk.CTk):
         self.configure(fg_color="#090D18")
 
         self._worker: threading.Thread | None = None
+        self._processing_active = False
         self._cancel_event = threading.Event()
         self._events: Queue[QueueEvent] = Queue()
         self._last_result: ProcessingResult | None = None
         self._crop_widgets: list[tk.Widget] = []
+        self._manual_crop_widgets: list[tk.Widget] = []
+        self._shared_crop_widgets: list[tk.Widget] = []
+        self._face_setting_widgets: list[tk.Widget] = []
         self._queue_refreshing = False
         self._queued_videos: list[QueuedVideo] = []
         self._selected_queue_index = 0
@@ -969,6 +1294,8 @@ class SpeechCutterApp(ctk.CTk):
         self.queue_summary_var = tk.StringVar(value="Tryb seryjny jest wyłączony.")
         self.source_info_var = tk.StringVar(value="Wybierz film, aby odczytać jego parametry.")
         self.crop_summary_var = tk.StringVar(value="Nie wybrano kadru.")
+        self.face_summary_var = tk.StringVar(value="Twarze nie zostały jeszcze wykryte.")
+        self.zoom_target_var = tk.StringVar(value=MANUAL_ZOOM_LABEL)
         self.status_var = tk.StringVar(value="Wybierz film i rozpocznij eksport.")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.padding_seconds_var = tk.DoubleVar(value=NATURAL_SETTINGS.speech_pad_ms / 1000)
@@ -1028,6 +1355,10 @@ class SpeechCutterApp(ctk.CTk):
         self.audio_boost_enabled_var = tk.BooleanVar(value=False)
         self.audio_boost_gain_db_var = tk.DoubleVar(value=_read_saved_audio_boost_gain_db())
         self.audio_boost_gain_value_var = tk.StringVar()
+        self.face_padding_percent_var = tk.DoubleVar(value=_read_saved_face_padding_percent())
+        self.face_padding_value_var = tk.StringVar()
+        self.face_max_zoom_var = tk.DoubleVar(value=_read_saved_face_max_zoom())
+        self.face_max_zoom_value_var = tk.StringVar()
 
         self.padding_seconds_var.trace_add("write", self._refresh_setting_labels)
         self.crop_every_var.trace_add("write", self._refresh_setting_labels)
@@ -1038,6 +1369,8 @@ class SpeechCutterApp(ctk.CTk):
         self.push_in_zoom_percent_var.trace_add("write", self._refresh_setting_labels)
         self.background_music_volume_percent_var.trace_add("write", self._refresh_setting_labels)
         self.audio_boost_gain_db_var.trace_add("write", self._refresh_setting_labels)
+        self.face_padding_percent_var.trace_add("write", self._refresh_setting_labels)
+        self.face_max_zoom_var.trace_add("write", self._refresh_setting_labels)
 
         self._configure_styles()
         self._refresh_setting_labels()
@@ -1168,6 +1501,8 @@ class SpeechCutterApp(ctk.CTk):
         self.push_in_zoom_percent_value_var.set(f"{float(self.push_in_zoom_percent_var.get()):.0f}%")
         self.background_music_volume_value_var.set(f"{float(self.background_music_volume_percent_var.get()):.0f}%")
         self.audio_boost_gain_value_var.set(f"+{float(self.audio_boost_gain_db_var.get()):.1f} dB")
+        self.face_padding_value_var.set(f"{float(self.face_padding_percent_var.get()):.0f}%")
+        self.face_max_zoom_value_var.set(f"{float(self.face_max_zoom_var.get()):.1f}x")
 
     def _on_padding_scale(self, value: str) -> None:
         snapped = min(3.0, max(0.0, round(float(value) / 0.05) * 0.05))
@@ -1222,6 +1557,19 @@ class SpeechCutterApp(ctk.CTk):
             self.audio_boost_gain_db_var.set(snapped)
         self._schedule_settings_save()
 
+    def _on_face_padding_scale(self, value: str) -> None:
+        snapped = min(80.0, max(0.0, round(float(value))))
+        if abs(float(self.face_padding_percent_var.get()) - snapped) > 1e-9:
+            self.face_padding_percent_var.set(snapped)
+        self._schedule_settings_save()
+
+    def _on_face_max_zoom_scale(self, value: str) -> None:
+        snapped = min(2.5, max(1.1, round(float(value) / 0.1) * 0.1))
+        snapped = round(snapped, 1)
+        if abs(float(self.face_max_zoom_var.get()) - snapped) > 1e-9:
+            self.face_max_zoom_var.set(snapped)
+        self._schedule_settings_save()
+
     def _schedule_settings_save(self) -> None:
         if self._settings_save_after_id is not None:
             self.after_cancel(self._settings_save_after_id)
@@ -1232,6 +1580,8 @@ class SpeechCutterApp(ctk.CTk):
         settings = _load_app_settings()
         settings["background_music_volume_percent"] = float(self.background_music_volume_percent_var.get())
         settings["audio_boost_gain_db"] = float(self.audio_boost_gain_db_var.get())
+        settings["face_padding_percent"] = float(self.face_padding_percent_var.get())
+        settings["face_max_zoom"] = float(self.face_max_zoom_var.get())
         _save_app_settings(settings)
 
     def _on_scroll_frame_configure(self, _event: tk.Event[tk.Widget] | None = None) -> None:
@@ -1881,6 +2231,8 @@ class SpeechCutterApp(ctk.CTk):
                     path=keep_video.path,
                     metadata=dict(keep_video.metadata),
                     crop_rect=keep_video.crop_rect,
+                    face_analysis=keep_video.face_analysis,
+                    selected_face_ids=keep_video.selected_face_ids,
                 )
             ]
             self._selected_queue_index = 0
@@ -1937,6 +2289,8 @@ class SpeechCutterApp(ctk.CTk):
                         path=path,
                         metadata=dict(existing.metadata),
                         crop_rect=existing.crop_rect,
+                        face_analysis=existing.face_analysis,
+                        selected_face_ids=existing.selected_face_ids,
                     )
                 )
             else:
@@ -2058,6 +2412,8 @@ class SpeechCutterApp(ctk.CTk):
         self._crop_rect = video.crop_rect
         self._update_source_info_for_video(video)
         self._update_crop_summary_for_video(video)
+        self._update_face_summary_for_video(video)
+        self._update_crop_state()
         self._refresh_queue_list()
 
     def _update_source_info_for_video(self, video: QueuedVideo) -> None:
@@ -2096,6 +2452,30 @@ class SpeechCutterApp(ctk.CTk):
             prefix + f"Kadr: x={x}, y={y}, szerokość={crop_width}, wysokość={crop_height}"
         )
 
+    def _update_face_summary_for_video(self, video: QueuedVideo | None) -> None:
+        prefix = ""
+        if video is not None and self.queue_enabled_var.get() and len(self._queued_videos) > 1:
+            prefix = f"Film {self._selected_queue_index + 1} z {len(self._queued_videos)}. "
+
+        if video is None or video.face_analysis is None:
+            self.face_summary_var.set(prefix + "Twarze nie zostały jeszcze wykryte.")
+            return
+        if not video.face_analysis.faces:
+            self.face_summary_var.set(prefix + "Nie znaleziono twarzy w tym filmie.")
+            return
+
+        total = len(video.face_analysis.faces)
+        selected = tuple(video.selected_face_ids)
+        if selected:
+            labels = ", ".join(f"#{face_id}" for face_id in selected)
+            self.face_summary_var.set(
+                prefix + f"Wybrane twarze: {labels} (z {total} wykrytych)."
+            )
+        else:
+            self.face_summary_var.set(
+                prefix + f"Automatycznie: największa z {total} wykrytych twarzy w każdym segmencie."
+            )
+
     def _clear_active_video_state(self, *, clear_input: bool) -> None:
         if clear_input:
             self.input_var.set("")
@@ -2104,6 +2484,7 @@ class SpeechCutterApp(ctk.CTk):
         self._crop_rect = None
         self.source_info_var.set("Wybierz film, aby odczytać jego parametry.")
         self.crop_summary_var.set("Nie wybrano kadru.")
+        self.face_summary_var.set("Twarze nie zostały jeszcze wykryte.")
         self._update_crop_state()
 
     def _ensure_single_video_selection(self) -> QueuedVideo | None:
@@ -2193,11 +2574,236 @@ class SpeechCutterApp(ctk.CTk):
         return preview_temp_dir, payload  # type: ignore[return-value]
 
     def _update_crop_state(self) -> None:
-        state = "normal" if self.crop_enabled_var.get() else "disabled"
+        face_mode = self.zoom_target_var.get() == FACE_ZOOM_LABEL
+        crop_enabled = bool(self.crop_enabled_var.get())
+        if face_mode and not crop_enabled:
+            self.zoom_target_var.set(MANUAL_ZOOM_LABEL)
+            face_mode = False
+        shared_state = "normal" if crop_enabled else "disabled"
+        manual_state = "normal" if crop_enabled and not face_mode else "disabled"
         for widget in self._crop_widgets:
-            widget.configure(state=state)
-        queue_crop_state = state if self.queue_enabled_var.get() and len(self._queued_videos) > 1 else "disabled"
-        self.pick_queue_crops_button.configure(state=queue_crop_state)
+            widget.configure(state=manual_state)
+        for widget in getattr(self, "_shared_crop_widgets", ()):
+            widget.configure(state=shared_state)
+        queue_crop_state = (
+            manual_state
+            if self.queue_enabled_var.get() and len(self._queued_videos) > 1
+            else "disabled"
+        )
+        if hasattr(self, "pick_queue_crops_button"):
+            self.pick_queue_crops_button.configure(state=queue_crop_state)
+
+        face_state = "normal" if crop_enabled and face_mode else "disabled"
+        for widget in self._face_setting_widgets:
+            widget.configure(state=face_state)
+
+        selected_video = self._get_selected_video()
+        has_faces = bool(
+            selected_video
+            and selected_video.face_analysis
+            and selected_video.face_analysis.faces
+        )
+        if hasattr(self, "detect_faces_button"):
+            self.detect_faces_button.configure(
+                state="disabled" if self._processing_active else "normal"
+            )
+        if hasattr(self, "choose_faces_button"):
+            self.choose_faces_button.configure(
+                state="normal" if has_faces and not self._processing_active else "disabled"
+            )
+
+    def _on_zoom_target_changed(self) -> None:
+        if self.zoom_target_var.get() == FACE_ZOOM_LABEL:
+            self.crop_enabled_var.set(True)
+            video = self._get_selected_video()
+            if video is not None and (
+                video.face_analysis is None or not video.face_analysis.faces
+            ):
+                should_scan = messagebox.askyesno(
+                    "Brak wykrytych twarzy",
+                    "Ten film nie ma jeszcze wykrytych twarzy.\n\nUruchomić wykrywanie teraz?",
+                )
+                if should_scan:
+                    self._detect_faces_clicked()
+                else:
+                    self.zoom_target_var.set(MANUAL_ZOOM_LABEL)
+        self._update_crop_state()
+        self._update_face_summary_for_video(self._get_selected_video())
+
+    def _detect_faces_clicked(self) -> None:
+        current_video = self._get_selected_video()
+        if current_video is None:
+            current_video = self._ensure_single_video_selection()
+        if current_video is None:
+            return
+
+        videos = [current_video]
+        if self.queue_enabled_var.get() and len(self._queued_videos) > 1:
+            scan_all = messagebox.askyesnocancel(
+                "Wykrywanie twarzy",
+                (
+                    f"W kolejce są {len(self._queued_videos)} filmy.\n\n"
+                    "Tak: wykryj twarze we wszystkich.\n"
+                    "Nie: tylko w bieżącym filmie."
+                ),
+            )
+            if scan_all is None:
+                return
+            if scan_all:
+                videos = list(self._queued_videos)
+
+        scanned_with_faces: list[QueuedVideo] = []
+        for index, video in enumerate(videos, start=1):
+            if len(videos) > 1:
+                self.status_var.set(
+                    f"Wykrywanie twarzy w filmie {index} z {len(videos)}: {video.path.name}"
+                )
+                self.update_idletasks()
+            analysis = self._scan_faces_for_video(video)
+            if analysis is None:
+                self.status_var.set("Wykrywanie twarzy anulowane.")
+                return
+            video.face_analysis = analysis
+            if analysis.faces:
+                scanned_with_faces.append(video)
+                self._append_log(
+                    f"Wykryto {len(analysis.faces)} twarzy w {video.path.name}."
+                )
+            else:
+                self._append_log(f"Nie znaleziono twarzy w {video.path.name}.")
+                if len(videos) == 1:
+                    messagebox.showwarning(
+                        "Nie znaleziono twarzy",
+                        (
+                            "Nie udało się znaleźć żadnej twarzy w tym filmie.\n\n"
+                            "Spróbuj filmu z widoczną, frontalną twarzą albo użyj ręcznego kadru."
+                        ),
+                    )
+
+        if len(videos) == 1 and scanned_with_faces:
+            selected = self._choose_faces_dialog(
+                scanned_with_faces[0].face_analysis,
+                scanned_with_faces[0].selected_face_ids,
+            )
+            if selected is not None:
+                scanned_with_faces[0].selected_face_ids = selected
+
+        if scanned_with_faces:
+            self.zoom_target_var.set(FACE_ZOOM_LABEL)
+            self.crop_enabled_var.set(True)
+            if len(videos) > 1:
+                self._append_log(
+                    "Tryb twarzy włączony. Dla kolejki domyślnie wybierana jest największa twarz w każdym segmencie."
+                )
+            self.status_var.set(f"Gotowe. Wykryto twarze w {len(scanned_with_faces)} filmie/filmach.")
+        else:
+            self.zoom_target_var.set(MANUAL_ZOOM_LABEL)
+            self.status_var.set("Nie wykryto twarzy. Pozostaje ręczny kadr.")
+        self._update_crop_state()
+        self._update_face_summary_for_video(self._get_selected_video())
+        self._refresh_queue_list()
+
+    def _choose_faces_clicked(self) -> None:
+        video = self._get_selected_video()
+        if video is None:
+            video = self._ensure_single_video_selection()
+        if video is None:
+            return
+        if video.face_analysis is None:
+            self._detect_faces_clicked()
+            return
+        if not video.face_analysis.faces:
+            messagebox.showinfo("Brak twarzy", "W tym filmie nie wykryto żadnej twarzy.")
+            return
+        selected = self._choose_faces_dialog(video.face_analysis, video.selected_face_ids)
+        if selected is None:
+            return
+        video.selected_face_ids = selected
+        self.crop_enabled_var.set(True)
+        self.zoom_target_var.set(FACE_ZOOM_LABEL)
+        self._update_crop_state()
+        self._update_face_summary_for_video(video)
+        self._refresh_queue_list()
+
+    def _choose_faces_dialog(
+        self,
+        analysis: FaceAnalysis,
+        selected_ids: tuple[int, ...],
+    ) -> tuple[int, ...] | None:
+        dialog = FaceSelectionDialog(
+            self,
+            analysis=analysis,
+            selected_ids=selected_ids,
+        )
+        self.wait_window(dialog)
+        return dialog.result
+
+    def _scan_faces_for_video(self, video: QueuedVideo) -> FaceAnalysis | None:
+        if not video.metadata:
+            self._ensure_metadata_for_video(video)
+        duration = float(video.metadata.get("duration") or 0.0) or None
+        dialog = FaceScanDialog(self, video_name=video.path.name)
+        result_queue: Queue[tuple[str, object]] = Queue()
+        result_holder: dict[str, object] = {}
+
+        def worker() -> None:
+            try:
+                analysis = detect_faces(
+                    video.path,
+                    duration=duration,
+                    progress_callback=lambda value, status: result_queue.put(
+                        ("progress", (value, status))
+                    ),
+                    cancel_callback=dialog.cancel_event.is_set,
+                )
+            except FaceDetectionCancelledError:
+                result_queue.put(("cancelled", None))
+            except Exception as exc:  # noqa: BLE001
+                result_queue.put(("error", exc))
+            else:
+                result_queue.put(("ok", analysis))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        def poll() -> None:
+            try:
+                while True:
+                    kind, payload = result_queue.get_nowait()
+                    if kind == "progress":
+                        value, status = payload  # type: ignore[misc]
+                        dialog.set_progress(float(value), str(status))
+                    elif kind == "ok":
+                        result_holder["analysis"] = payload
+                    elif kind == "error":
+                        result_holder["error"] = payload
+                    elif kind == "cancelled":
+                        result_holder["cancelled"] = True
+            except Empty:
+                pass
+
+            if thread.is_alive():
+                if dialog.winfo_exists():
+                    dialog.after(100, poll)
+                return
+            if dialog.winfo_exists():
+                dialog.after(10, dialog.destroy)
+
+        poll()
+        self.wait_window(dialog)
+
+        if "error" in result_holder:
+            error = result_holder["error"]
+            if isinstance(error, FaceDetectionError):
+                message = str(error)
+            else:
+                message = f"Nie udało się wykryć twarzy:\n\n{error}"
+            messagebox.showerror("Błąd wykrywania twarzy", message)
+            return None
+        if result_holder.get("cancelled"):
+            return None
+        analysis = result_holder.get("analysis")
+        return analysis if isinstance(analysis, FaceAnalysis) else None
 
     def _choose_crop_visually(self) -> None:
         if self.queue_enabled_var.get():
@@ -2335,9 +2941,15 @@ class SpeechCutterApp(ctk.CTk):
                 max(0.0, float(self.background_music_volume_percent_var.get()) / 100.0),
             )
             audio_boost_gain_db = min(24.0, max(0.0, float(self.audio_boost_gain_db_var.get())))
+            face_padding = min(1.5, max(0.0, float(self.face_padding_percent_var.get()) / 100.0))
+            face_max_zoom = min(4.0, max(1.01, float(self.face_max_zoom_var.get())))
         except (tk.TclError, ValueError):
             messagebox.showerror("Invalid settings", "One of the trim, crop, motion, or music settings is not valid.")
             return None
+        face_mode = (
+            self.zoom_target_var.get() == FACE_ZOOM_LABEL
+            and bool(self.crop_enabled_var.get())
+        )
 
         if self.queue_enabled_var.get():
             videos = list(self._queued_videos)
@@ -2355,7 +2967,7 @@ class SpeechCutterApp(ctk.CTk):
             messagebox.showerror("Missing file", f"The selected source video does not exist:\n\n{missing_files[0]}")
             return None
 
-        if self.crop_enabled_var.get():
+        if self.crop_enabled_var.get() and not face_mode:
             missing_crop_index = next((index for index, video in enumerate(videos) if video.crop_rect is None), None)
             if missing_crop_index is not None:
                 if self.queue_enabled_var.get() and self._queued_videos:
@@ -2451,7 +3063,7 @@ class SpeechCutterApp(ctk.CTk):
         for video, output_path in zip(videos, output_paths):
             crop_rect = video.crop_rect if self.crop_enabled_var.get() else None
             crop_settings = CropSettings(
-                enabled=bool(self.crop_enabled_var.get() and crop_rect),
+                enabled=bool(self.crop_enabled_var.get() and (crop_rect or face_mode)),
                 x=crop_rect[0] if crop_rect else 0,
                 y=crop_rect[1] if crop_rect else 0,
                 width=crop_rect[2] if crop_rect else 0,
@@ -2467,6 +3079,17 @@ class SpeechCutterApp(ctk.CTk):
                 push_in_min_segment_seconds=push_in_min_seconds,
                 push_in_max_zoom=push_in_max_zoom,
             )
+            face_settings = FaceZoomSettings(
+                enabled=face_mode,
+                faces=tuple(video.face_analysis.faces) if video.face_analysis else (),
+                selected_face_ids=tuple(video.selected_face_ids) if video.face_analysis else (),
+                padding=face_padding,
+                max_zoom=face_max_zoom,
+            )
+            if face_mode and video.face_analysis is None:
+                self._append_log(
+                    f"{video.path.name}: twarze nie były jeszcze skanowane; wykonam skan podczas eksportu."
+                )
             background_music_settings = BackgroundMusicSettings(
                 enabled=bool(self.background_music_enabled_var.get()),
                 path=DEFAULT_BACKGROUND_MUSIC_PATH,
@@ -2486,6 +3109,7 @@ class SpeechCutterApp(ctk.CTk):
                         merge_gap_ms=NATURAL_SETTINGS.merge_gap_ms,
                         crop=crop_settings,
                         motion=motion_settings,
+                        faces=face_settings,
                         background_music=background_music_settings,
                         audio_boost=audio_boost_settings,
                         captions=caption_settings,
@@ -2694,10 +3318,12 @@ class SpeechCutterApp(ctk.CTk):
             messagebox.showerror("Could not finish", str(event.payload))
 
     def _set_running(self, is_running: bool) -> None:
+        self._processing_active = is_running
         self.start_button.configure(state="disabled" if is_running else "normal")
         self.cancel_button.configure(state="normal" if is_running else "disabled")
         if is_running:
             self.open_folder_button.configure(state="disabled")
+        self._update_crop_state()
 
     def _append_log(self, message: str) -> None:
         self.log_box.configure(state="normal")

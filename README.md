@@ -10,7 +10,8 @@ Speech Cutter is a small desktop app that loads a video, finds the parts with hu
 - Saves the result as `<original_name>_speech_only.mp4` in the same folder as the source video.
 - Uses the natural trim profile by default, with a simple padding control in seconds.
 - Can optionally crop selected segments with a visual frame picker that stays locked to the original video aspect ratio.
-- Can add a slow center push-in to longer speech segments for subtle visual motion.
+- Can detect distinct faces and optionally aim the zooms at a chosen face instead of a manual crop.
+- Can add a slow push-in to longer speech segments for subtle visual motion, centered on the frame or on the selected face.
 - Adds looped "Monkeys Spinning Monkeys" background music by default, with a checkbox to turn it off and a remembered volume slider.
 - Can burn in TikTok-style subtitles with a highlighted active word.
 - Offers an optional enhanced Polish recognition mode using a larger speech-to-text model and Polish-specific decoding.
@@ -69,6 +70,28 @@ $env:GROQ_API_KEY="your-key"
 .\.venv\Scripts\python app.py input.mp4 --captions --transcription-provider groq
 ```
 
+To detect faces and aim zooms at the largest visible face:
+
+```powershell
+.\.venv\Scripts\python app.py input.mp4 --face-zoom
+```
+
+To follow specific detected faces, run once with `--face-zoom` to see the detected ids in the log, then pass the ids (repeat `--face-id` for several faces):
+
+```powershell
+.\.venv\Scripts\python app.py input.mp4 --face-zoom --face-id 2 --face-padding 0.4 --face-max-zoom 1.8
+```
+
+## Face-targeted zooms
+
+1. Load a video and enable "Włącz dynamiczny kadr".
+2. Set "Cel przybliżeń" to "Twarze".
+3. Click "Wykryj twarze". The scan samples frames, groups detections into distinct face tracks, and shows a thumbnail per face.
+4. Pick one or more faces in the dialog, or leave everything unchecked to automatically follow the largest visible face in each segment.
+5. Adjust "Oddech wokół twarzy" and "Limit przybliżenia twarzy", then export.
+
+Face mode reuses the existing zoom cadence controls ("Co który segment mowy", "Pomiń segmenty krótsze niż", "Czas przybliżenia"). In queue mode you can scan every video at once; videos without a scan are analyzed automatically during export. If no face is found in a segment, the manual crop is used when one exists; otherwise that segment is rendered without a zoom. Switching back to "Kadr ręczny" restores the manual crop picker.
+
 ## Notes
 
 - The exported file is always MP4 for wide compatibility.
@@ -80,8 +103,9 @@ $env:GROQ_API_KEY="your-key"
 - Gemini correction is opt-in and sends the transcript text (not the video or audio) to the Gemini API.
 - Groq transcription is opt-in and uploads compressed mono FLAC audio. Local Whisper remains the default and works offline.
 - The GUI can remember Groq and Gemini API keys securely in Windows Credential Manager; keys are not written to the app's JSON settings.
+- Face detection runs locally with OpenCV and the bundled YuNet model; no video data is uploaded.
 
-## Third-party component
+## Third-party components
 
 This app bundles the official Silero VAD 16 kHz ONNX model under the MIT license.
 
@@ -92,3 +116,8 @@ It also bundles "Monkeys Spinning Monkeys" by Kevin MacLeod for optional backgro
 
 - Source: [incompetech](https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1400011)
 - License copy: [third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt](third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt)
+
+It also bundles the YuNet face detection model, loaded through OpenCV.
+
+- Project: [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
+- License copy: [third_party_licenses/YuNet-LICENSE.txt](third_party_licenses/YuNet-LICENSE.txt)
