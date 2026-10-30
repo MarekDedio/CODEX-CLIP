@@ -95,7 +95,7 @@ When the number of people is known, stop scanning as soon as they are found:
 1. Load a video and enable "Włącz dynamiczny kadr".
 2. Set "Cel przybliżeń" to "Twarze".
 3. Optionally choose the expected number of people under "Liczba osób". "Auto" scans every sample; picking a number stops the scan once that many faces are confirmed.
-4. Click "Wykryj twarze". The scan samples at most 480 frames spread across the video, groups detections into distinct face tracks, and shows a thumbnail per face. Real faces and anime/VTuber-style faces are detected together, and overlapping hits are merged so one face becomes one track. The dialog shows "Wykryte twarze: N" while it works; click "Wystarczy" to stop searching early and keep the faces found so far.
+4. Click "Wykryj twarze". The scan samples at most 480 frames spread across the video, groups detections into distinct face tracks, and shows a thumbnail per face. Real faces and anime/VTuber-style faces are detected together, and overlapping hits are merged so one face becomes one track. SFace embeddings also reconnect the same face when it disappears and returns later, so it is not counted twice. The dialog shows "Wykryte twarze: N" while it works; click "Wystarczy" to stop searching early and keep the faces found so far.
 5. Pick one or more faces in the dialog, or leave everything unchecked to automatically follow the largest visible face in each segment.
 6. Adjust "Oddech wokół twarzy" and "Limit przybliżenia twarzy", then export.
 
@@ -112,7 +112,7 @@ Face mode reuses the existing zoom cadence controls ("Co który segment mowy", "
 - Gemini correction is opt-in and sends the transcript text (not the video or audio) to the Gemini API.
 - Groq transcription is opt-in and uploads compressed mono FLAC audio. Local Whisper remains the default and works offline.
 - The GUI can remember Groq and Gemini API keys securely in Windows Credential Manager; keys are not written to the app's JSON settings.
-- Face detection runs locally with OpenCV and the bundled YuNet and anime-face models; no video data is uploaded. Real faces, anime characters, and VTuber avatars are counted as faces.
+- Face detection and re-identification run locally with OpenCV and the bundled YuNet, anime-face, and SFace models; no video data is uploaded. Real faces, anime characters, and VTuber avatars are counted as faces.
 
 ## Third-party components
 
@@ -135,3 +135,8 @@ It also bundles the DeepGHS anime face detection model, loaded through ONNX Runt
 
 - Project: [deepghs/anime_face_detection](https://huggingface.co/deepghs/anime_face_detection)
 - License copy: [third_party_licenses/Anime-Face-Detection-LICENSE.txt](third_party_licenses/Anime-Face-Detection-LICENSE.txt)
+
+It also bundles the SFace face recognition model, loaded through OpenCV, to reconnect the same face when it appears again and keep it as one track.
+
+- Project: [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface)
+- License copy: [third_party_licenses/SFace-LICENSE.txt](third_party_licenses/SFace-LICENSE.txt)

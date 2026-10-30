@@ -9,8 +9,11 @@ import unittest
 from speech_cutter.faces import (
     DetectedFace,
     FaceBox,
+    _FaceTrack,
     _detect_anime_frame_faces,
+    _merge_duplicate_tracks,
     _merge_face_detections,
+    _track_detections,
     choose_face_for_range,
     compute_face_crop,
     detect_faces,
@@ -40,6 +43,27 @@ def make_face(face_id: int, x: int, y: int, width: int, height: int, *, start: f
         screen_time=end - start,
         first_seen=start,
         last_seen=end,
+    )
+
+
+def make_track(
+    *,
+    times: tuple[float, ...],
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    crop: object,
+) -> _FaceTrack:
+    boxes = [FaceBox(time=time, x=x, y=y, width=width, height=height, score=0.9) for time in times]
+    return _FaceTrack(
+        boxes=boxes,
+        last_box=boxes[-1],
+        last_seen=boxes[-1].time,
+        best_area=max(box.area for box in boxes),
+        first_crop=crop,
+        best_crop=crop,
+        last_crop=crop,
     )
 
 
@@ -91,6 +115,16 @@ class _FakeFaceDetectorFactory:
         return _FakeFaceDetector(self.detections)
 
 
+class _FakeFaceRecognizer:
+    """Deterministic SFace stand-in: the crop's mean colour is the embedding."""
+
+    def feature(self, crop: object) -> object:
+        import numpy as np
+
+        mean = np.mean(crop, axis=(0, 1), dtype=np.float32)
+        return (mean - 127.5).reshape(1, 3)
+
+
 class _FakeOnnxInput:
     name = "images"
 
@@ -121,6 +155,9 @@ class FaceScanTests(unittest.TestCase):
         anime_patch = patch("speech_cutter.faces._create_anime_detector", lambda _ort: empty)
         anime_patch.start()
         self.addCleanup(anime_patch.stop)
+        recognizer_patch = patch("speech_cutter.faces._create_face_recognizer", lambda _cv2: None)
+        recognizer_patch.start()
+        self.addCleanup(recognizer_patch.stop)
 
     @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
     def test_scan_stops_after_requested_face_count(self) -> None:
@@ -402,6 +439,140 @@ class FaceMergeTests(unittest.TestCase):
         merged = _merge_face_detections([first, second], [duplicate, new_face])
 
         self.assertEqual(merged, [first, second, new_face])
+
+
+class FaceTrackDeduplicationTests(unittest.TestCase):
+    @staticmethod
+    def _solid(colour: tuple[int, int, int], size: tuple[int, int] = (240, 320)) -> object:
+        import numpy as np
+
+        return np.full((size[0], size[1], 3), colour, dtype=np.uint8)
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_reidentifies_same_face_after_motion_gap(self) -> None:
+        import cv2
+        import numpy as np
+
+        frame = self._solid((255, 0, 0))
+        detection = FaceBox(time=0.0, x=100, y=50, width=80, height=80, score=0.9)
+        recognizer = _FakeFaceRecognizer()
+        tracks: list[_FaceTrack] = []
+
+        _track_detections(cv2, np, frame, [detection], 0.0, tracks, max_gap=1.5, recognizer=recognizer)
+        _track_detections(cv2, np, frame, [detection], 6.0, tracks, max_gap=1.5, recognizer=recognizer)
+
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual([box.time for box in tracks[0].boxes], [0.0, 6.0])
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_does_not_reidentify_different_face_after_motion_gap(self) -> None:
+        import cv2
+        import numpy as np
+
+        detection = FaceBox(time=0.0, x=100, y=50, width=80, height=80, score=0.9)
+        recognizer = _FakeFaceRecognizer()
+        tracks: list[_FaceTrack] = []
+
+        _track_detections(
+            cv2, np, self._solid((255, 0, 0)), [detection], 0.0, tracks, max_gap=1.5, recognizer=recognizer
+        )
+        _track_detections(
+            cv2, np, self._solid((0, 0, 255)), [detection], 6.0, tracks, max_gap=1.5, recognizer=recognizer
+        )
+
+        self.assertEqual(len(tracks), 2)
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_merges_duplicate_boxes_detected_in_the_same_frame(self) -> None:
+        import cv2
+        import numpy as np
+
+        frame = self._solid((255, 0, 0))
+        detection = FaceBox(time=0.0, x=100, y=50, width=80, height=80, score=0.9)
+        recognizer = _FakeFaceRecognizer()
+        tracks: list[_FaceTrack] = []
+
+        _track_detections(
+            cv2, np, frame, [detection, detection], 0.0, tracks, max_gap=1.5, recognizer=recognizer
+        )
+        self.assertEqual(len(tracks), 2)
+
+        merged = _merge_duplicate_tracks(cv2, np, recognizer, tracks)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(len(merged[0].boxes), 2)
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_merges_same_face_tracks_separated_in_time(self) -> None:
+        import cv2
+        import numpy as np
+
+        crop = self._solid((255, 0, 0))
+        first = make_track(times=(0.5, 1.0), x=100, y=50, width=80, height=80, crop=crop)
+        second = make_track(times=(3.0, 3.5), x=100, y=50, width=80, height=80, crop=crop)
+
+        merged = _merge_duplicate_tracks(cv2, np, _FakeFaceRecognizer(), [first, second])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual([box.time for box in merged[0].boxes], [0.5, 1.0, 3.0, 3.5])
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_keeps_simultaneous_distinct_faces(self) -> None:
+        import cv2
+        import numpy as np
+
+        first = make_track(
+            times=(0.5,), x=100, y=50, width=80, height=80, crop=self._solid((255, 0, 0))
+        )
+        second = make_track(
+            times=(0.5,), x=400, y=50, width=80, height=80, crop=self._solid((0, 0, 255))
+        )
+
+        merged = _merge_duplicate_tracks(cv2, np, _FakeFaceRecognizer(), [first, second])
+
+        self.assertEqual(len(merged), 2)
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_keeps_different_faces_separated_in_time(self) -> None:
+        import cv2
+        import numpy as np
+
+        first = make_track(
+            times=(0.5, 1.0), x=100, y=50, width=80, height=80, crop=self._solid((255, 0, 0))
+        )
+        second = make_track(
+            times=(3.0, 3.5), x=100, y=50, width=80, height=80, crop=self._solid((0, 0, 255))
+        )
+
+        merged = _merge_duplicate_tracks(cv2, np, _FakeFaceRecognizer(), [first, second])
+
+        self.assertEqual(len(merged), 2)
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_does_not_merge_tracks_outside_reid_window(self) -> None:
+        import cv2
+        import numpy as np
+
+        crop = self._solid((255, 0, 0))
+        first = make_track(times=(0.5,), x=100, y=50, width=80, height=80, crop=crop)
+        second = make_track(times=(12.0,), x=100, y=50, width=80, height=80, crop=crop)
+
+        merged = _merge_duplicate_tracks(cv2, np, _FakeFaceRecognizer(), [first, second])
+
+        self.assertEqual(len(merged), 2)
+
+    @unittest.skipUnless(_CV2_AVAILABLE, "OpenCV is not installed")
+    def test_does_not_merge_faces_with_very_different_sizes(self) -> None:
+        import cv2
+        import numpy as np
+
+        crop = self._solid((255, 0, 0))
+        first = make_track(times=(0.5,), x=100, y=50, width=100, height=100, crop=crop)
+        second = make_track(times=(3.0,), x=100, y=50, width=40, height=40, crop=crop)
+
+        merged = _merge_duplicate_tracks(cv2, np, _FakeFaceRecognizer(), [first, second])
+
+        self.assertEqual(len(merged), 2)
 
 
 class FaceCropTests(unittest.TestCase):

@@ -35,3 +35,12 @@ This project bundles the `anime_face_detection_yolov8n.onnx` model from the Deep
 - License: MIT
 
 The full license text is included in [third_party_licenses/Anime-Face-Detection-LICENSE.txt](third_party_licenses/Anime-Face-Detection-LICENSE.txt).
+
+## SFace face recognition model
+
+This project bundles the `face_recognition_sface_2021dec_int8bq.onnx` model from the OpenCV Model Zoo to re-identify faces between frames and merge duplicate face tracks for face-targeted zooms.
+
+- Project: [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface)
+- License: Apache 2.0
+
+The full license text is included in [third_party_licenses/SFace-LICENSE.txt](third_party_licenses/SFace-LICENSE.txt).
