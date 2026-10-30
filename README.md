@@ -33,7 +33,7 @@ The first caption-enabled run also downloads a Whisper speech-to-text model.
 
 ### Option 1: double-click launcher
 
-Run [run.bat](C:\Users\Marel\Desktop\CODEX CLIP\run.bat).
+Run [run.bat](run.bat).
 
 The launcher will:
 
@@ -86,9 +86,9 @@ $env:GROQ_API_KEY="your-key"
 This app bundles the official Silero VAD 16 kHz ONNX model under the MIT license.
 
 - Repo: [snakers4/silero-vad](https://github.com/snakers4/silero-vad)
-- License copy: [third_party_licenses/Silero-VAD-LICENSE.txt](C:\Users\Marel\Desktop\CODEX CLIP\third_party_licenses\Silero-VAD-LICENSE.txt)
+- License copy: [third_party_licenses/Silero-VAD-LICENSE.txt](third_party_licenses/Silero-VAD-LICENSE.txt)
 
 It also bundles "Monkeys Spinning Monkeys" by Kevin MacLeod for optional background music.
 
 - Source: [incompetech](https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1400011)
-- License copy: [third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt](C:\Users\Marel\Desktop\CODEX CLIP\third_party_licenses\Monkeys-Spinning-Monkeys-LICENSE.txt)
+- License copy: [third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt](third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt)

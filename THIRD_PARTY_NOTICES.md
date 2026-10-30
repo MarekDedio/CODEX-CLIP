@@ -7,7 +7,7 @@ This project bundles the official `silero_vad_16k_op15.onnx` model from the Sile
 - Project: [snakers4/silero-vad](https://github.com/snakers4/silero-vad)
 - License: MIT
 
-The full license text is included in [third_party_licenses/Silero-VAD-LICENSE.txt](C:\Users\Marel\Desktop\CODEX CLIP\third_party_licenses\Silero-VAD-LICENSE.txt).
+The full license text is included in [third_party_licenses/Silero-VAD-LICENSE.txt](third_party_licenses/Silero-VAD-LICENSE.txt).
 
 ## Monkeys Spinning Monkeys
 
@@ -16,4 +16,4 @@ This project bundles "Monkeys Spinning Monkeys" by Kevin MacLeod for optional ba
 - Source: [incompetech](https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1400011)
 - License: Creative Commons Attribution 4.0
 
-The license notice is included in [third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt](C:\Users\Marel\Desktop\CODEX CLIP\third_party_licenses\Monkeys-Spinning-Monkeys-LICENSE.txt).
+The license notice is included in [third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt](third_party_licenses/Monkeys-Spinning-Monkeys-LICENSE.txt).
